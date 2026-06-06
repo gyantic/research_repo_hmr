@@ -10,9 +10,13 @@
 - `romp_video_demo.py` — 動画入力のベンチマーク用デモ（`--metrics_csv` で per-frame 速度を出力）。論文の ROMP 速度評価で使用。
 - `tools/export_torchao_int8_backbone_romp.py` / `export_quantized_weights_romp.py` — int8 量子化重みのエクスポート。
 
+## 環境
+conda 環境ファイル [environment.yml](environment.yml)（env 名 `romp_3.9`）を同梱。
+作成: `conda env create -f environment.yml` → `conda activate romp_3.9`。
+
 ## 実行に必要（リポジトリ非収録）
 - ROMP の学習済みモデルと SMPL モデルデータ（上流の手順で取得し `~/.romp/` 等へ配置）。
-- 本研究の速度評価は conda 環境 `romp_3.9`。実行設定は [../measurements/](../measurements/) の `romp_video_*.yml` / `romp_resnet_video_*.yml`。
+- 速度評価の実行設定は [../measurements/](../measurements/) の `romp_video_*.yml` / `romp_resnet_video_*.yml`。
 
 ## 除外したもの
 学習済み重み (`trained_models/` 等)・SMPL データ・デモ用動画/画像・各種出力。

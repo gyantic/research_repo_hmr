@@ -10,9 +10,13 @@
 - **ツール群** `tools/`（量子化・TensorRT/ONNX エクスポート・キャリブレーション・3DPW 評価・プロット・transport ベンチ 等）と一括実行 `run_*.sh`。
 - **設定 / ドキュメント**: `configs/run/eval_3dpw_*.yaml`・`train_qat.yaml`、`docs/`（量子化計画・int8 仕様・TensorRT 等）。
 
+## 環境
+conda 環境ファイル [environment.yml](environment.yml)（env 名 `sathmr-copy`）を同梱。
+作成: `conda env create -f environment.yml` → `conda activate sathmr-copy`。
+
 ## 実行に必要（リポジトリ非収録）
 - SAT-HMR 重み（例 `weights/sat_hmr/sat_644*.pth`）・DINOv2 系バックボーン・データセット（3DPW 等）。上流の手順で取得し配置。
-- 本研究では conda 環境 `sathmr-copy`。論文の SAT-HMR 速度/精度は `video_demo.py` で計測。
+- 論文の SAT-HMR 速度/精度は `video_demo.py` で計測。
 
 ## 除外したもの
 重み (`weights/`)・データセット (`datasets/` `datas/`)・venv・各種出力 (`plots/` `outputs/` `*.nsys-rep` `*.sqlite` `*_kern.txt`)・動画。

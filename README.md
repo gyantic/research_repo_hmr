@@ -29,12 +29,18 @@
 
 ## セットアップ概要
 
-各モデルは元リポジトリと同じ環境で動きます（本研究では conda 環境
-`romp_3.9` / `sathmr-copy` / `sam_3d_body` を使用）。
+各モデルの conda 環境ファイルを同梱しています（本研究で使用した環境をそのまま export）。
+まとめず、モデルごとに個別の `environment.yml` です。
 
-1. 対応する上流リポジトリの手順に従い依存関係をインストール
+| モデル | 環境ファイル | env 名 |
+|---|---|---|
+| ROMP | [romp/environment.yml](romp/environment.yml) | `romp_3.9` |
+| SAT-HMR | [sat-hmr/environment.yml](sat-hmr/environment.yml) | `sathmr-copy` |
+| Fast-SAM-3D-Body | [fast-sam-3d-body/environment.yml](fast-sam-3d-body/environment.yml) | `sam_3d_body` |
+
+1. 各環境を作成: `conda env create -f <model>/environment.yml`
 2. 公式配布元から重み・SMPL/MHR モデル・データセットを取得し、各 README 記載の場所へ配置
-3. 各サブディレクトリのスクリプトを実行
+3. 対応する env を `conda activate` して各サブディレクトリのスクリプトを実行
 
 ## 評価の再現
 

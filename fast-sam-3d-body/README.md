@@ -11,9 +11,13 @@
 - TensorRT 変換まわりの改変: `build_tensorrt.sh`、`convert_backbone_tensorrt.py`、`convert_moge_encoder_trt.py`、`convert_yolo_pose_trt.py`、`sam_3d_body/models/backbones/dinov3_tensorrt.py` 等。
 - `mhr2smpl/multi_view/step0_infer_3dpw.py` — 3DPW 推論サンプル (sample_*.npz) 生成（FastSAM 精度評価の入力）。
 
+## 環境
+conda 環境ファイル [environment.yml](environment.yml)（env 名 `sam_3d_body`）を同梱。
+作成: `conda env create -f environment.yml` → `conda activate sam_3d_body`。
+
 ## 実行に必要（リポジトリ非収録）
 - `checkpoints/`（SAM-3D-Body / DINOv3 / MoGe / YOLO 重み・TensorRT エンジン）、MHR モデル、3DPW データ。上流・公式配布元から取得し配置。
-- 本研究では conda 環境 `sam_3d_body`。精度評価は [../measurements/](../measurements/) の評価スクリプトで実施。
+- 精度評価は [../measurements/](../measurements/) の評価スクリプトで実施。
 
 ## 除外したもの
 重み・チェックポイント・TensorRT エンジン（`checkpoints/` 配下。ただしユーザー改変の `model_config.yaml` 等の設定/JSON は保持）、
