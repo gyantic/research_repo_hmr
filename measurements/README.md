@@ -10,6 +10,7 @@
 |---|---|---|
 | `benchmark_fastsam3dbody.py` | Fast-SAM-3D-Body の速度計測（`--output_csv` で per-frame） | FastSAM 速度 |
 | `evaluate_fastsam3dbody_3dpw_paper_repro.py` | Fast-SAM-3D-Body の 3DPW 精度（MPJPE/PA-MPJPE/PVE） | FastSAM 精度 |
+| `evaluate_fastsam3dbody_h36m14_accuracy.py` | Fast-SAM-3D-Body の 3DPW 精度を H36M14（SAT-HMR 揃え）で算出（MPJPE/PA-MPJPE/PVE/MPVAE/MVE、mean/median/MAD）。MHR→SMPL は barycentric 変換。fp32/bf16/int8_trt の sample_*.npz に適用 | FastSAM 精度（H36M14） |
 | `summarize_inference_stats.py` | 各モデルの per-frame 速度 CSV を集計しサマリ CSV を生成 | 速度サマリ全体 |
 | `romp_video_*.yml`, `romp_resnet_video_*.yml` | ROMP 速度計測の実行設定（`romp_video_demo.py --configs_yml`） | ROMP 速度 |
 
