@@ -1,0 +1,39 @@
+
+ARGS:
+ tab: 'process_video'
+ gpu: 0 
+
+ backbone: 'hrnet'
+ #backbone: 'resnet'
+ #model_precision: 'fp32'
+ torch_compile: True
+ #model_precision: 'fp16'
+ model_precision: 'bf16'   # bfloat16: faster on Ampere+ GPUs, half file size when pre-converted
+ torchao_int8_weight_only: False  # int8 weight-only quant via torchao IntxWeightOnlyConfig for Conv2d/Linear (bf16 base recommended)
+ torchao_int8_scope: 'backbone'
+ val_batch_size: 1
+ nw: 1
+ #model_path: trained_models/ROMP_HRNet32_V1.pkl #  '../trained_models/ROMP_ResNet50_V1.pkl'
+ model_path: trained_models/ROMP_HRNet32_V1_bf16.pth  # pre-converted bf16 weights
+ #model_path: trained_models/ROMP_ResNet50_V1.pkl
+ #model_path: trained_models/ROMP_HRNet32_V1_ft_3DPW.pkl
+
+ smpl_mesh_root_align: False
+ centermap_conf_thresh: 0.25
+ input_size: 512
+ make_tracking: False
+ temporal_optimization: False
+ smooth_coeff: 4.
+ show_largest_person_only: True #もともとはFalse
+ show_mesh_stand_on_image: False
+ soi_camera: 'far' # 'close' # 'far'
+ renderer: 'pyrender' # 'pyrender' 'pytorch3d' 
+
+ inputs: 'demo/videos/sample_video.mp4' # None
+ output_dir: 'demo/sample_video_results/'
+ save_mesh: False
+ save_centermap: False
+ save_dict_results: True
+ save_visualization_on_img: True
+ fps_save: 24
+ mesh_cloth: 'ghostwhite'  #'LightCyan'

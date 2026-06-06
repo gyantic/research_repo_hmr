@@ -1,0 +1,80 @@
+# === 重み / データセット / 学習資産 ===
+weights/
+datasets/
+datas/
+# checkpoints はDLした重み置き場 → 原則除外。ただしユーザー改変のconfig/docは残す
+checkpoints/**
+!checkpoints/**/
+!checkpoints/**/*.yaml
+!checkpoints/**/*.yml
+!checkpoints/**/*.json
+!checkpoints/**/*.md
+!checkpoints/**/LICENSE
+trained_models/
+model_data/
+data/
+smpl/
+outputs/
+results/
+sam3d_body_annotations/
+
+# === 実行環境 / ビルド生成物 ===
+venv*/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.o
+*.a
+*.egg-info/
+build/
+dist/
+*.cpython-*.so
+
+# === 大容量バイナリ / モデル / メッシュ / 動画 ===
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.trt
+*.plan
+*.npz
+*.npy
+*.pkl
+*.h5
+*.mp4
+*.avi
+*.mov
+*.bvh
+*.fbx
+*.obj
+# 注: *.gif / *.png / *.jpg は README・結果図として維持（除外しない）
+
+# === 計測 / プロファイル / ログ ===
+*.nsys-rep
+*.sqlite
+*.csv
+*.log
+*.bak
+*.bak.*
+*_kern.txt
+
+# === 中間出力ディレクトリ ===
+render_output/
+render_frames/
+traceresults/
+plots/
+videos/
+demo_results/
+output/
+
+# === エディタ / OS / ツール ===
+.codex/
+.claude/
+.idea/
+.vscode/
+*:Zone.Identifier
+.DS_Store
