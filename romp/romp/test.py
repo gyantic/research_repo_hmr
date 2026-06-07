@@ -18,6 +18,8 @@ class Demo(Base):
     def test_eval(self):
         if self.eval_dataset == 'pw3d_test':
             data_loader = self._create_single_data_loader(dataset='pw3d', train_flag = False, mode='vibe', split='test')
+        elif self.eval_dataset == 'pw3d_normal':
+            data_loader = self._create_single_data_loader(dataset='pw3d', train_flag = False, mode='normal', split='test')
         elif self.eval_dataset == 'pw3d_oc':
             data_loader = self._create_single_data_loader(dataset='pw3d', train_flag = False, split='all', mode='OC')
         elif self.eval_dataset == 'pw3d_pc':

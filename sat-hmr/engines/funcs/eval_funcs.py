@@ -427,9 +427,11 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
 
     # store arrays per sample then concatenate once at the end
     mve, mpjpe, pa_mpjpe, pa_mve = [], [], [], []
+    paper_pa = []  # paper-protocol PA-MPJPE: SMPL J24[:14] pred vs GT SMPL J24[:14]
     cur_device = next(model.parameters()).device
     smpl_layer = model.human_model
     smpl2h36m_regressor = torch.from_numpy(smpl_layer.smpl2h36m_regressor).float().to(cur_device)
+    smpl_j24_regressor = smpl_layer.layer_n.J_regressor.detach().float().cpu().numpy().astype(np.float32)
     
     progress_bar = tqdm(total=len(eval_dataloader), disable=not accelerator.is_local_main_process)
     progress_bar.set_description('evaluate')
@@ -446,6 +448,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
         batch_mpjpe = []
         batch_pa_mve = []
         batch_pa_mpjpe = []
+        batch_paper_pa = []
 
         bs = len(targets)
         for idx in range(bs):
@@ -457,6 +460,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
             sample_pa_mve = [float('inf')]
             sample_mpjpe = [float('inf')]
             sample_pa_mpjpe = [float('inf')]
+            sample_paper_pa = [float('inf')]
 
             # gt 
             gt_verts = targets[idx]['verts']
@@ -532,6 +536,13 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
                 error_v, pa_error_v = cal_3d_position_error(pred3d_verts, gt3d_verts)
                 sample_mve.append(float(error_v))
                 sample_pa_mve.append(float(pa_error_v))
+                # paper protocol: SMPL J24[:14] (pred vs GT), Procrustes (FastSAM3DBody paper)
+                pred_full = pred_verts_list[i].reshape(-1, 3)
+                gt_full = gt_verts_list[i].reshape(-1, 3)
+                pred_j24_14 = (smpl_j24_regressor @ pred_full)[:14]
+                gt_j24_14 = (smpl_j24_regressor @ gt_full)[:14]
+                _, pa_paper = cal_3d_position_error(pred_j24_14, gt_j24_14)
+                sample_paper_pa.append(float(pa_paper))
 
             # counting and visualization
             step += 1
@@ -542,6 +553,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
             batch_pa_mve.append(np.array(sample_pa_mve))
             batch_mpjpe.append(np.array(sample_mpjpe))
             batch_pa_mpjpe.append(np.array(sample_pa_mpjpe))
+            batch_paper_pa.append(np.array(sample_paper_pa))
 
             img_idx = step + accelerator.process_index*len(eval_dataloader)*bs
             if vis and (img_idx%vis_step == 0) and len(matched_verts_idx) > 0:
@@ -568,6 +580,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
             batch_pa_mve = accelerator.gather_for_metrics(batch_pa_mve)
             batch_mpjpe = accelerator.gather_for_metrics(batch_mpjpe)
             batch_pa_mpjpe = accelerator.gather_for_metrics(batch_pa_mpjpe)
+            batch_paper_pa = accelerator.gather_for_metrics(batch_paper_pa)
 
         # update totals
         total_count += sum(batch_count)
@@ -577,6 +590,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
         pa_mve += batch_pa_mve
         mpjpe += batch_mpjpe
         pa_mpjpe += batch_pa_mpjpe
+        paper_pa += batch_paper_pa
 
         progress_bar.update(1)
 
@@ -585,6 +599,7 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
     pa_mve = np.concatenate([item[1:] for item in pa_mve], axis=0).tolist() if len(pa_mve) > 0 else []
     mpjpe = np.concatenate([item[1:] for item in mpjpe], axis=0).tolist() if len(mpjpe) > 0 else []
     pa_mpjpe = np.concatenate([item[1:] for item in pa_mpjpe], axis=0).tolist() if len(pa_mpjpe) > 0 else []
+    paper_pa = np.concatenate([item[1:] for item in paper_pa], axis=0).tolist() if len(paper_pa) > 0 else []
 
     if len(mpjpe) <= 0:
         return "Failed to evaluate. Keep training!"
@@ -595,8 +610,18 @@ def evaluate_3dpw(model, eval_dataloader, conf_thresh,
 
     error_dict['MPJPE'] = round(float(sum(mpjpe)/len(mpjpe)), 1)
     error_dict['PA-MPJPE'] = round(float(sum(pa_mpjpe)/len(pa_mpjpe)), 1)
+    error_dict['PAPER-PA-MPJPE'] = round(float(sum(paper_pa)/len(paper_pa)), 2) if len(paper_pa) > 0 else -1
     error_dict['MVE'] = round(float(sum(mve)/len(mve)), 1)
     error_dict['PA-MVE'] = round(float(sum(pa_mve)/len(pa_mve)), 1)
+    # median + MAD (H36M14 joints / vertices), count
+    def _med_mad(x):
+        a = np.asarray(x, dtype=np.float64); m = float(np.median(a))
+        return round(m, 2), round(float(np.median(np.abs(a - m))), 2)
+    for _name, _arr in (('MPJPE', mpjpe), ('PA-MPJPE', pa_mpjpe), ('MVE', mve), ('PA-MVE', pa_mve)):
+        _md, _mad = _med_mad(_arr)
+        error_dict[_name + '_median'] = _md
+        error_dict[_name + '_mad'] = _mad
+    error_dict['eval_count'] = len(mpjpe)
 
     if accelerator.is_main_process:
         with open(os.path.join(results_save_path,'results.txt'),'w') as f:

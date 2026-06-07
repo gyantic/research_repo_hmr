@@ -51,6 +51,7 @@ dist/
 *.bvh
 *.fbx
 *.obj
+*.csv
 # 注: *.gif / *.png / *.jpg は README・結果図として維持（除外しない）
 
 # === 計測 / プロファイル / ログ ===
