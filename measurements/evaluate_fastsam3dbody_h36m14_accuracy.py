@@ -35,7 +35,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_csv", required=True)
     p.add_argument("--data_dir", default="/mnt/e/sathmr_data/3dpw")
     p.add_argument("--batch_size", type=int, default=128)
-    p.add_argument("--max_samples", type=int, default=0)
     p.add_argument("--smpl_model", default="/home/kyuta/ROMP/model_data/parameters/SMPL_NEUTRAL.pkl")
     p.add_argument("--smpl_model_dir", default="/home/kyuta/ROMP/model_data/parameters")
     p.add_argument("--mapping", default="/home/kyuta/Fast-SAM-3D-Body/mhr2smpl/data/mhr2smpl_mapping.npz")
@@ -98,8 +97,6 @@ def main() -> None:
     args = parse_args()
     dev = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     files = sorted(Path(args.samples_dir).glob("sample_*.npz"))
-    if args.max_samples > 0:
-        files = files[: args.max_samples]
     if not files:
         raise SystemExit(f"No sample_*.npz in {args.samples_dir}")
 

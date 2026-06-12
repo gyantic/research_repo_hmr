@@ -34,7 +34,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vertices_npz", default="", help="Optional fitted SMPL vertices npz with pred_smpl_vertices")
     parser.add_argument("--data_dir", default="/home/kyuta/Fast-SAM-3D-Body/data/3DPW")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--max_samples", type=int, default=0)
     parser.add_argument("--smpl_model", default="/home/kyuta/ROMP/model_data/parameters/SMPL_NEUTRAL.pkl")
     parser.add_argument("--smpl_model_dir", default="/home/kyuta/ROMP/model_data/parameters")
     parser.add_argument("--mapping", default="/home/kyuta/Fast-SAM-3D-Body/mhr2smpl/data/mhr2smpl_mapping.npz")
@@ -145,8 +144,6 @@ def main() -> None:
     args = parse_args()
     samples_dir = Path(args.samples_dir)
     sample_files = sorted(samples_dir.glob("sample_*.npz"))
-    if args.max_samples > 0:
-        sample_files = sample_files[: args.max_samples]
     if not sample_files:
         raise SystemExit(f"No sample_*.npz files found in {samples_dir}")
 
