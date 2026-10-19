@@ -192,9 +192,10 @@ def build_cam_intrinsics_from_img_size(img_size_hw: Tuple[int, int], input_size:
 
 
 def setup_render_imports(no_render: bool):
-    """Import pyrender-based mesh rendering. Returns (no_render, render_fns or None).
+    """Import pyrender-based mesh rendering. Returns (ok, render_fns or None).
 
-    On import failure rendering is disabled instead of aborting the run.
+    ok is False when the import failed; the caller then disables rendering
+    instead of aborting the run.
     """
     if no_render:
         return True, None

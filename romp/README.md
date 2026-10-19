@@ -5,8 +5,7 @@
 
 ## 主な独自追加
 - `romp/generator_bonebasedMesh.py` — SMPL pose を関節クォータニオンへ変換し **TCP** で Unreal Engine へ送信。推論時間の統計 CSV も出力。
-- `romp/generator_bonebasedMesh_UDPver.py` — 上記の **UDP** 版（ffmpeg 給餌・再現性固定・SCSC2 ヘッダ付き）。
-- `romp/make_clothmap.py` / `make_proxy_obj.py` / `make_smpl_face.py` — 衣装スキンウェイト/プロキシ OBJ/SMPL face などの補助アセットを一度だけ生成。
+- `romp/generator_bonebasedMesh_UDPver.py` — 上記の **UDP** 版（ffmpeg で 12 fps に揃えて入力）。
 - `romp_video_demo.py` — 動画入力のベンチマーク用デモ（`--metrics_csv` で per-frame 速度を出力）。論文の ROMP 速度評価で使用。
 - `tools/export_torchao_int8_backbone_romp.py` / `export_quantized_weights_romp.py` — int8 量子化重みのエクスポート。
 
@@ -14,13 +13,9 @@
 conda 環境ファイル [environment.yml](environment.yml)（env 名 `romp_3.9`）を同梱。
 作成: `conda env create -f environment.yml` → `conda activate romp_3.9`。
 
-## 実行に必要な資産（Git追跡外）
+## 実行の準備
 - ROMP の学習済みモデル（`trained_models/` へ配置）。SMPL はリポジトリ直下の `body_models/smpl/` を共用し、ROMP 用の `SMPL_NEUTRAL.pth` もそこへ生成する（手順はルート README）。
 - 速度評価の実行設定は [../measurements/romp/configs/](../measurements/romp/configs/) の `romp_video_*.yml` / `romp_resnet_video_*.yml`。
-
-## Git追跡外の資産
-
-学習済み重み・モデルデータ・入力動画・推論結果・ログはGit追跡外です。必要な資産は元のリポジトリの導入手順に従って配置してください。
 
 ## 動画推論
 

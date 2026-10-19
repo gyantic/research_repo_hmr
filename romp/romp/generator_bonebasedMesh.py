@@ -18,7 +18,7 @@ from romp.processor_bootstrap import build_video_processor
 from romp.ue_pose_message import format_ue_pose_message
 
 CONFIG_YML = "configs/video.yml"
-VIDEO_PATH = "demo/videos/sample_video(camera_fixed).mp4"
+VIDEO_PATH = "../datasets/videos/sample_video.mp4"
 WARMUP_FRAMES = 10
 
 

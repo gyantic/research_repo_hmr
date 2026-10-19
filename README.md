@@ -241,8 +241,7 @@ PYTHONPATH="$PWD:$PWD/romp" PYOPENGL_PLATFORM=egl python romp_video_demo.py \
 |---|---|
 | [romp/romp_video_demo.py](romp/romp_video_demo.py) | 動画入力のベンチマーク用デモ |
 | [romp/romp/generator_bonebasedMesh.py](romp/romp/generator_bonebasedMesh.py) | SMPL姿勢を関節クォータニオンへ変換し、TCPでUEへ送信。推論時間の統計CSVも出力 |
-| [romp/romp/generator_bonebasedMesh_UDPver.py](romp/romp/generator_bonebasedMesh_UDPver.py) | 上記のUDP版（ffmpeg入力・再現性固定・SCSC2ヘッダ付き） |
-| `romp/romp/make_clothmap.py`、`make_proxy_obj.py`、`make_smpl_face.py` | 衣装スキンウェイト、プロキシOBJ、SMPL faceなどの補助アセットを一度だけ生成 |
+| [romp/romp/generator_bonebasedMesh_UDPver.py](romp/romp/generator_bonebasedMesh_UDPver.py) | 上記のUDP版（ffmpegで12 fpsに揃えて入力） |
 | `romp/tools/export_torchao_int8_backbone_romp.py`、`export_quantized_weights_romp.py` | INT8量子化重みのエクスポート |
 
 ### SAT-HMR

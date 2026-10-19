@@ -1,7 +1,7 @@
 """Seeding and deterministic-backend settings shared by the ROMP video entry points.
 
 Applied once when ``romp.predict.video`` is imported, so every script that builds a
-``Video_processor`` (romp_video_demo.py, the UE generators, make_proxy_obj.py) runs
+``Video_processor`` (romp_video_demo.py, the UE generators) runs
 with the same settings before the model is built.
 """
 import os

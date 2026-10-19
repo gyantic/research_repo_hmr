@@ -7,19 +7,13 @@ Waits for a "hello" datagram from UE, then feeds a video through ffmpeg at a fix
 Run from the romp/ directory:
     PYTHONPATH="$PWD:$PWD/romp" python romp/generator_bonebasedMesh_UDPver.py
 """
-import cv2, socket, time, subprocess, struct
+import cv2, socket, time, subprocess
 import numpy as np
 import torch
 
 from romp.processor_bootstrap import build_video_processor
 from romp.ue_pose_message import format_ue_pose_message
 
-
-def scsc2_pack_len(msg_bytes: bytes, little=True) -> bytes:
-    # SCSC2 "By Length" ヘッダ: '<' | endian | uint32 size | '>'
-    endian_flag = b'\x00' if little else b'\x01'
-    size_bytes  = struct.pack('<I' if little else '>I', len(msg_bytes))
-    return b'<' + endian_flag + size_bytes + b'>'
 
 def to_numpy_float32(x):
     if hasattr(x, "detach"):
@@ -62,7 +56,7 @@ print(f"[HELLO] from {addr} -> dst={(UE_HOST, UE_PORT)}")
 # HELLO受信時刻を記録
 time_connection_success = time.perf_counter()
 
-VIDEO_PATH = "demo/videos/sample_video(camera_fixed).mp4"
+VIDEO_PATH = "../datasets/videos/sample_video.mp4"
 
 W, H = 1280, 720
 STREAM_FPS = 12

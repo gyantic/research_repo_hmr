@@ -15,13 +15,9 @@
 conda 環境ファイル [environment.yml](environment.yml)（env 名 `sathmr-copy`）を同梱。
 作成: `conda env create -f environment.yml` → `conda activate sathmr-copy`。
 
-## 実行に必要な資産（Git追跡外）
+## 実行の準備
 - SAT-HMR 重み（例 `weights/sat_hmr/sat_644*.pth`）・DINOv2 系バックボーン・データセット（3DPW 等）。元のリポジトリの手順で取得し配置。
 - 論文の SAT-HMR 速度/精度は `video_demo.py` で計測。
-
-## Git追跡外の資産
-
-学習済み重み・モデルデータ・入力動画・推論結果・ログはGit追跡外です。必要な資産は元のリポジトリの導入手順に従って配置してください。
 
 ## 動画推論
 

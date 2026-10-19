@@ -1,6 +1,6 @@
 """Build a ROMP ``Video_processor`` from a short ROMP argument list.
 
-Shared by romp_video_demo.py, the UE generator scripts and make_proxy_obj.py.
+Shared by romp_video_demo.py and the UE generator scripts.
 Run them from the ``romp/`` directory (config paths such as ``configs/video.yml``
 are relative to it) with ``PYTHONPATH="$PWD:$PWD/romp"``.
 """

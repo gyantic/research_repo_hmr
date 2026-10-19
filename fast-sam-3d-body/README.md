@@ -15,13 +15,9 @@
 conda 環境ファイル [environment.yml](environment.yml)（env 名 `sam_3d_body`）を同梱。
 作成: `conda env create -f environment.yml` → `conda activate sam_3d_body`。
 
-## 実行に必要な資産（Git追跡外）
+## 実行の準備
 - `checkpoints/`（SAM-3D-Body / DINOv3 / MoGe / YOLO 重み・TensorRT エンジン）、MHR モデル、3DPW データ。公式配布元から取得し配置。
 - 精度評価は [../measurements/fastsam/evaluate_3dpw.py](../measurements/fastsam/evaluate_3dpw.py) で実施。
-
-## Git追跡外の資産
-
-学習済み重み・モデルデータ・入力動画・推論結果・ログはGit追跡外です。必要な資産は元のリポジトリの導入手順に従って配置してください。
 
 ## 推論と評価
 
