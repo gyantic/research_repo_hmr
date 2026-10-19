@@ -1,29 +1,59 @@
-# measurements（評価・計測コード）
+# measurements（論文の精度・速度評価）
 
-論文の評価表（精度・速度、`all_model_results` / `paper_results` 相当）の各行を生成した
-評価/集計コードと、ROMP 実行設定のみを収録。**評価結果の CSV 自体は含めません**（データのため除外）。
-どのコードがどの行を出したかは、元の `all_model_results.csv` の `command` 列に基づき特定しています。
+論文の計測を実行するスクリプト・設定と、集計・図の生成コードを、モデルごとにまとめています。モデル本体の推論コードは各モデルのディレクトリ（`romp/`・`sat-hmr/`・`fast-sam-3d-body/`）にあり、ここから呼び出します。
 
-## 収録物
+```text
+measurements/
+  romp/
+    run.sh                     ROMP の計測（速度・精度・UDP）
+    benchmark_romp_udp_ue.py   UE へ UDP 送信しながらの計測（図5）
+    evaluate_3dpw.py           3DPW の精度評価（結果を JSON に保存）
+    configs/                   romp_video_demo.py に渡す設定（バックボーン・数値精度・compile）
+  sathmr/
+    run.sh                     SAT-HMR の計測（速度・compile 範囲・精度・UDP）
+  fastsam/
+    run.sh                     Fast-SAM-3D-Body の計測（速度・精度・UDP）
+    benchmark_fastsam3dbody.py 速度計測
+    evaluate_3dpw.py           3DPW の精度評価
+    convert_weights_bf16.py    bf16 重みの作成とサイズの集計（Table 2）
+  run_all.sh                   すべての計測・評価を実行して paper_results.csv を作る
+  make_paper_results.py        計測・評価の出力から paper_results.csv を作る
+  summarize_speed.py           生データから推論時間の中央値・MAD を出す
+  paper_figures/               論文の図の生成
+```
 
-| ファイル | 役割 | 生成する論文行 |
+## 計測の実行
+
+```bash
+bash measurements/run_all.sh
+```
+
+作成された `paper_results.csv`（リポジトリ直下）を使って、論文の図を作成できます。計測・評価の出力は `results/measurements/rerun_<日時>/` に保存されます。脚注1の値は、Fast-SAM-3D-Body が `accuracy_fastsam_fp32/metrics_paper_3dpw14.json` の `PA-MPJPE` の `mean`、SAT-HMR が `accuracy_sathmr_fp32.txt` の `PAPER-PA-MPJPE` に出ます。
+
+## 論文の図
+
+[paper_figures/](paper_figures/) のスクリプトで論文の図を生成します。pandas・matplotlib が必要です。
+
+| スクリプト | 論文の図 | 出力 |
 |---|---|---|
-| `benchmark_fastsam3dbody.py` | Fast-SAM-3D-Body の速度計測（`--output_csv` で per-frame） | FastSAM 速度 |
-| `evaluate_fastsam3dbody_3dpw_paper_repro.py` | Fast-SAM-3D-Body の 3DPW 精度（MPJPE/PA-MPJPE/PVE） | FastSAM 精度 |
-| `evaluate_fastsam3dbody_h36m14_accuracy.py` | Fast-SAM-3D-Body の 3DPW 精度を H36M14（SAT-HMR 揃え）で算出（MPJPE/PA-MPJPE/PVE/MPVAE/MVE、mean/median/MAD）。MHR→SMPL は barycentric 変換。fp32/bf16/int8_trt の sample_*.npz に適用 | FastSAM 精度（H36M14） |
-| `summarize_inference_stats.py` | 各モデルの per-frame 速度 CSV を集計しサマリ CSV を生成 | 速度サマリ全体 |
-| `romp_video_*.yml`, `romp_resnet_video_*.yml` | ROMP 速度計測の実行設定（`romp_video_demo.py --configs_yml`） | ROMP 速度 |
+| [plot_speed_vs_accuracy.py](paper_figures/plot_speed_vs_accuracy.py) | 図2（推論時間と3DPW精度。torch.compile ありの構成、エラーバーは2×MAD） | `speed_vs_{PAMPJPE,MPJPE,PVE,PAPVE}__compile.png`、論文値の★付きの `speed_vs_{PAMPJPE,MPJPE,PVE}__compile_with_papervalue.png` |
+| [plot_sathmr_int8_compile_scope.py](paper_figures/plot_sathmr_int8_compile_scope.py) | 図3（SAT-HMR INT8 のコンパイル範囲ごとの推論時間） | `sathmr_int8_compile_scope.png` |
+| [plot_udp_overhead.py](paper_figures/plot_udp_overhead.py) | 図5（UE同時実行時の推論時間増加） | `udp_overhead.png`、対応付けた表 `udp_overhead.csv` |
 
-## 他モデルの計測コードの所在
-- ROMP 速度: [../romp/romp_video_demo.py](../romp/romp_video_demo.py)（本フォルダの yml を使用）
-- SAT-HMR 速度: [../sat-hmr/video_demo.py](../sat-hmr/video_demo.py)
-- FastSAM 速度(int8_trt/UE): [../fast-sam-3d-body/run_publisher_ue.py](../fast-sam-3d-body/run_publisher_ue.py)
-- FastSAM 精度の入力 (sample_*.npz): [../fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py](../fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py)
+```bash
+python measurements/paper_figures/plot_speed_vs_accuracy.py
+python measurements/paper_figures/plot_sathmr_int8_compile_scope.py
+python measurements/paper_figures/plot_udp_overhead.py
+```
 
-## 除外したもの
-評価の生出力・サマリ CSV（`raw_*.csv` / `all_model_results.csv` / `paper_results*.csv` 等）、ログ・`.bak`・
-評価出力ディレクトリ。論文表に対応しない探索的な評価/診断スクリプト（`evaluate_*` の他バリアント・
-`diagnose_*`・`analyze_*`・`stream_*` 等）も command 列に現れないため非収録。
+## 入力データ
 
-> 注: `paper_results` の `robust_*`（median/IQR/MAD）列はスクリプト化されておらず（該当コード無し）、
-> アドホックに算出されたため再現コードは収録できていません。
+| データ | 置き場所 | 用意の方法 |
+|---|---|---|
+| 速度計測の入力動画（1280×720・約30 fps・528フレーム。3モデル共通。Fast-SAM-3D-Body の INT8 較正にも使用） | `datasets/videos/sample_video.mp4` | [動画ACの素材ページ](https://video-ac.com/video/1201)から HD サイズ（1280×720）をダウンロードし、`sample_video.mp4` として配置します（固定カメラ・単一人物の実写動画）。 |
+| 3DPW | `datasets/3dpw/` | ルートREADMEの[3DPWの配置](../README.md#3dpwの配置)を参照してください。 |
+| CMU Panoptic Studio の動画（図4・UEのデモ） | `datasets/cmu_panoptic/person_clips/` | 下記のシーケンスを使用しました。 |
+
+CMU Panoptic Studio の動画は、シーケンス `171026_pose1`・`171204_pose2`・`171204_pose3`・`171204_pose4`・`171204_pose5` の HD 映像（カメラ `hd_00_00`）を使用しました。
+
+UEパッケージの起動方法は [ue/README.md](../ue/README.md) を参照してください。

@@ -1,15 +1,13 @@
 """
 SAT-HMR Webcam Demo
 Webカメラからリアルタイムで3Dメッシュ推定を行います。
-"""
 
-"""
-args：
---camera カメラID (デフォルト 0)
---conf_thresh：検出信頼度閾値 (デフォルト 0.3)
---save 録画する場合のファイル名
---width カメラ解像度の幅 (デフォルト 1280)
---height カメラ解像度の高さ (デフォルト 720)
+主な引数:
+  --camera カメラID (デフォルト 0)
+  --conf_thresh 検出信頼度閾値 (デフォルト 0.3)
+  --save 録画する場合のファイル名
+  --width カメラ解像度の幅 (デフォルト 1280)
+  --height カメラ解像度の高さ (デフォルト 720)
 """
 
 import argparse
@@ -33,25 +31,23 @@ def force_windows_create(self):
 # ライブラリの関数を、この関数で上書きする
 pyrender.OffscreenRenderer._create = force_windows_create
 import sys
-import yaml
 import cv2
 import numpy as np
 import torch
 import socket
-from tqdm import tqdm
 import time
-from PIL import Image
-from torchvision import transforms
-from scipy.spatial.transform import Rotation
 
 from models import build_sat_model
 from utils.transforms import unNormalize
 from utils.visualization import tensor_to_BGR, pad_img, vis_meshes_img, get_colors_rgb
+from sathmr_common import (
+    load_config,
+    preprocess_frame,
+    select_udp_target,
+    smpl_pose_to_ue_quaternions,
+    transl_to_ue,
+)
 
-ARRAY2TENSOR = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -90,136 +86,6 @@ def get_args():
     parser.add_argument('--udp_jump_hold_frames', type=int, default=4, help='ジャンプ確定後に外れ値抑制をバイパスするフレーム数')
     parser.add_argument('--udp_jump_cooldown', type=int, default=6, help='ジャンプ終了後に再判定を抑制するフレーム数')
     return parser.parse_args()
-
-
-def load_config(input_size):
-    demo_cfg_path = os.path.join('configs', 'run', 'demo.yaml')
-    with open(demo_cfg_path) as f:
-        demo_config = yaml.safe_load(f)
-    
-    model_name = demo_config.get('model', 'default')
-    model_cfg_path = os.path.join('configs', 'models', f'{model_name}.yaml')
-    with open(model_cfg_path) as f:
-        model_config = yaml.safe_load(f)
-    
-    class Config:
-        pass
-    
-    args = Config()
-    for k, v in model_config.items():
-        setattr(args, k, v)
-    for k, v in demo_config.items():
-        setattr(args, k, v)
-    
-    args.mode = 'infer'
-    args.pretrain = False
-    args.pretrain_path = None
-    args.input_size = input_size
-    
-    return args
-
-
-def process_img_like_base(img, input_size):
-    """BASEクラスのprocess_imgと同じ処理"""
-    ori_h, ori_w = img.shape[:2]
-    
-    # 長い辺をinput_sizeに合わせる
-    if ori_w >= ori_h:
-        resize_rate = input_size / ori_w
-        new_w = input_size
-        new_h = int(resize_rate * ori_h)
-    else:
-        resize_rate = input_size / ori_h
-        new_h = input_size
-        new_w = int(resize_rate * ori_w)
-    
-    img_resized = cv2.resize(img, (new_w, new_h))
-    img_size = (new_h, new_w)
-    
-    return img_resized, img_size, resize_rate
-
-
-def preprocess_frame(frame, input_size, use_sat=True):
-    """フレームを前処理（BASEクラスの__getitem__と同じ処理）"""
-    # BGR画像をそのまま使用（process_imgと同じ）
-    img_resized, img_size, resize_rate = process_img_like_base(frame, input_size)
-    
-    # パディング（__getitem__と同じ）
-    patch_size = 56 if use_sat else 14
-    pad_h = (img_size[0] + patch_size - 1) // patch_size * patch_size
-    pad_w = (img_size[1] + patch_size - 1) // patch_size * patch_size
-    
-    pad_img = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-    pad_img[:img_size[0], :img_size[1]] = img_resized
-    
-    # BGR -> RGB, PIL変換, 正規化
-    pil_img = Image.fromarray(pad_img[:, :, ::-1].copy())
-    
-    norm_img = ARRAY2TENSOR(pil_img)
-    
-    return norm_img, img_size, frame.shape[:2]
-
-
-def smpl_pose_to_ue_quaternions(pose):
-    rotations = Rotation.from_rotvec(pose.reshape(-1, 3))
-    quaternions = rotations.as_quat().astype(np.float32)  # (24,4) = (x,y,z,w)
-    quaternions[:, 0] *= -1.0
-    quaternions[:, 2] *= -1.0
-    flip_root = np.array([1., 0., 0., 0.], dtype=np.float32)
-    quaternions[0] = (
-        Rotation.from_quat(flip_root) * Rotation.from_quat(quaternions[0])
-    ).as_quat().astype(np.float32)
-    return quaternions
-
-
-def transl_to_ue(transl):
-    trans = transl.copy().astype(np.float32)
-    trans[1] *= -1.0
-    trans[2] = 0.0
-    return trans * 100.0
-
-
-def select_udp_target(cands, tracker_state, max_dist_cm, reinit_conf):
-    """前フレーム位置に近い候補を優先して1人選ぶ"""
-    if len(cands['confs']) == 0:
-        return None, tracker_state, None
-
-    confs = cands['confs']
-    poses = cands['poses']
-    transls = cands['transls']
-    query_ids = cands['query_ids']
-
-    best_idx = int(np.argmax(confs))
-    reason = "max_conf"
-
-    if tracker_state['active'] and tracker_state['transl'] is not None:
-        dists_cm = np.linalg.norm(transls - tracker_state['transl'][None, :], axis=1) * 100.0
-        near_idx = int(np.argmin(dists_cm))
-        near_dist = float(dists_cm[near_idx])
-        near_conf = float(confs[near_idx])
-        best_conf = float(confs[best_idx])
-
-        if near_dist <= max_dist_cm:
-            best_idx = near_idx
-            reason = f"nearest:{near_dist:.1f}cm"
-        elif best_conf >= reinit_conf:
-            reason = f"reinit_conf:{best_conf:.3f}"
-        else:
-            return None, tracker_state, f"skip_jump nearest={near_dist:.1f}cm conf={near_conf:.3f}"
-
-    selected = {
-        'pose': poses[best_idx],
-        'transl': transls[best_idx],
-        'conf': float(confs[best_idx]),
-        'query_id': int(query_ids[best_idx]),
-        'num_persons': len(confs),
-    }
-
-    tracker_state['active'] = True
-    tracker_state['transl'] = transls[best_idx].copy()
-    tracker_state['query_id'] = int(query_ids[best_idx])
-    tracker_state['missed'] = 0
-    return selected, tracker_state, reason
 
 
 def process_frame(model, frame, input_size, conf_thresh, device, no_render=False, amp=False):

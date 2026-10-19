@@ -18,4 +18,4 @@ ARGS:
  smpl_mesh_root_align: True
 
  model_path: trained_models/ROMP_ResNet50_V1.pkl
- dataset_rootdir: '/home/kyuta/ROMP/data'
+ dataset_rootdir: '../datasets'

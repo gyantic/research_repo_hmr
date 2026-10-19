@@ -1,7 +1,7 @@
 # romp（ROMP 改変版）
 
-上流: [Arthur151/ROMP](https://github.com/Arthur151/ROMP) @ `a8558ae` のコードに本研究の改変を加えたもの。
-上流の README は [README_UPSTREAM.md](README_UPSTREAM.md) に保存。
+元のリポジトリ: [Arthur151/ROMP](https://github.com/Arthur151/ROMP) @ `a8558ae` のコードに本研究の改変を加えたもの。
+元のリポジトリの README は [README_UPSTREAM.md](README_UPSTREAM.md) に保存。
 
 ## 主な独自追加
 - `romp/generator_bonebasedMesh.py` — SMPL pose を関節クォータニオンへ変換し **TCP** で Unreal Engine へ送信。推論時間の統計 CSV も出力。
@@ -14,11 +14,25 @@
 conda 環境ファイル [environment.yml](environment.yml)（env 名 `romp_3.9`）を同梱。
 作成: `conda env create -f environment.yml` → `conda activate romp_3.9`。
 
-## 実行に必要（リポジトリ非収録）
-- ROMP の学習済みモデルと SMPL モデルデータ（上流の手順で取得し `~/.romp/` 等へ配置）。
-- 速度評価の実行設定は [../measurements/](../measurements/) の `romp_video_*.yml` / `romp_resnet_video_*.yml`。
+## 実行に必要な資産（Git追跡外）
+- ROMP の学習済みモデル（`trained_models/` へ配置）。SMPL はリポジトリ直下の `body_models/smpl/` を共用し、ROMP 用の `SMPL_NEUTRAL.pth` もそこへ生成する（手順はルート README）。
+- 速度評価の実行設定は [../measurements/romp/configs/](../measurements/romp/configs/) の `romp_video_*.yml` / `romp_resnet_video_*.yml`。
 
-## 除外したもの
-学習済み重み (`trained_models/` 等)・SMPL データ・デモ用動画/画像・各種出力。
-頂点のみ送信していた旧ストリーミング試作（generate_mesh / generator_romp / mesh_generate_toUE）や
-描画クライアント (renderer*)・動作確認用スクラッチは整理時に除外。
+## Git追跡外の資産
+
+学習済み重み・モデルデータ・入力動画・推論結果・ログはGit追跡外です。必要な資産は元のリポジトリの導入手順に従って配置してください。
+
+## 動画推論
+
+```bash
+conda activate romp_3.9
+cd romp
+PYTHONPATH="$PWD:$PWD/romp" PYOPENGL_PLATFORM=egl python romp_video_demo.py \
+  --input /path/to/input.mp4 \
+  --configs_yml ../measurements/romp/configs/romp_video_fp32_no_compile.yml \
+  --no_render --no_save
+```
+
+入力は使用環境のOpenCVで読み込める動画形式を用意してください。モデル、数値精度、コンパイルの条件は `measurements/romp/configs/` のYAMLとコマンド引数で指定します。
+
+評価コードは [measurements](../measurements/README.md)、研究全体の構成は [ルートREADME](../README.md) を参照してください。

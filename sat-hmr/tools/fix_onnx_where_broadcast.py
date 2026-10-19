@@ -143,7 +143,6 @@ def rewrite_problematic_bool_where(model: onnx.ModelProto) -> tuple[onnx.ModelPr
             continue
 
         cond_name, x_name, y_name = node.input
-        cond_shape = shape_map.get(cond_name)
         x_shape = shape_map.get(x_name)
         y_shape = shape_map.get(y_name)
 

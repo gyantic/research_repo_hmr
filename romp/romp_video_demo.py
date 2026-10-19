@@ -20,7 +20,6 @@ import argparse
 import csv
 import os
 import pathlib
-import random
 import sys
 import time
 
@@ -29,28 +28,10 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-# ========= Seed固定 =========
-SEED = 42
+from romp.processor_bootstrap import build_video_processor
 
-
-def setup_reproducibility(seed: int = 42):
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    random.seed(seed)
-    np.random.seed(seed)
-    cv2.setRNGSeed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-setup_reproducibility(SEED)
+# Seed固定・決定論的設定 (romp/reproducibility.py) は、build_video_processor が
+# romp.predict.video を import した時点 (モデル構築前) で適用される。
 
 torch.set_num_threads(2)
 torch.set_num_interop_threads(1)
@@ -87,31 +68,26 @@ def get_args():
 # ========= ROMP 初期化 =========
 args_cli = get_args()
 
-arg_list = [
-    "--configs_yml", args_cli.configs_yml,
-    "--inputs",      args_cli.input,
-    "--gpu",         "0",
-]
-# dtype_cfg を model_precision に変換してconfig側に渡す
-_precision = "bf16" if str(args_cli.dtype_cfg).lower() in {"bf16", "bfloat16"} else "fp32"
-arg_list += ["--model_precision", _precision]
-if args_cli.torch_compile is not None:
-    arg_list += ["--torch_compile", "true" if args_cli.torch_compile else "false"]
-if args_cli.torchao_int8_weight_only is not None:
-    arg_list += ["--torchao_int8_weight_only", "true" if args_cli.torchao_int8_weight_only else "false"]
-if args_cli.torchao_int8_scope is not None:
-    arg_list += ["--torchao_int8_scope", args_cli.torchao_int8_scope]
+def romp_override_args(args_cli):
+    """Translate demo CLI flags into ROMP config overrides (applied after --configs_yml)."""
+    # dtype_cfg -> model_precision: anything other than bf16 runs fp32.
+    precision = "bf16" if str(args_cli.dtype_cfg).lower() in {"bf16", "bfloat16"} else "fp32"
+    overrides = ["--model_precision", precision]
+    # Tri-state switches: None keeps the value from the YAML config.
+    if args_cli.torch_compile is not None:
+        overrides += ["--torch_compile", "true" if args_cli.torch_compile else "false"]
+    if args_cli.torchao_int8_weight_only is not None:
+        overrides += ["--torchao_int8_weight_only", "true" if args_cli.torchao_int8_weight_only else "false"]
+    if args_cli.torchao_int8_scope is not None:
+        overrides += ["--torchao_int8_scope", args_cli.torchao_int8_scope]
+    return overrides
 
-sys.argv = [sys.argv[0]] + arg_list
 
-from romp.lib.config import parse_args, ConfigContext
-from romp.predict.video import Video_processor
+romp_proc = build_video_processor(
+    args_cli.configs_yml, args_cli.input, gpu="0", extra_args=romp_override_args(args_cli))
+# Predictor already put the model in eval mode (_prepare_modules_).
+
 from dataset.internet import img_preprocess as romp_img_preprocess
-
-with ConfigContext(parse_args(arg_list)) as cfg:
-    romp_proc = Video_processor(args_set=cfg)
-
-romp_proc.model.eval()
 
 
 # ========= process_frame =========

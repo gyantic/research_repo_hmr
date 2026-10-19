@@ -8,6 +8,9 @@ Usage:
     python convert_backbone_tensorrt.py --benchmark
     python convert_backbone_tensorrt.py --all
 
+    # INT8+FP16 engine (modelopt PTQ -> Q/DQ ONNX -> TensorRT)
+    python convert_backbone_tensorrt.py --quantize_onnx --convert_trt --int8
+
 The backbone accepts:
     Input: [B, 3, 512, 512] RGB image (normalized)
     Output: [B, 1280, 32, 32] feature map
@@ -37,6 +40,8 @@ USE_TRT_BACKBONE=1 TRT_BACKBONE_PATH=/path/to/backbone.engine python demo_human.
 """
 
 import argparse
+import csv
+import datetime
 import os
 import sys
 import time
@@ -48,6 +53,12 @@ import torch.nn as nn
 parent_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, parent_dir)
 
+from trt_calibration_frames import (
+    DEFAULT_CALIB_VIDEO,
+    DEFAULT_NUM_CALIB_FRAMES,
+    sample_video_frames_rgb,
+)
+
 
 # Default paths
 CHECKPOINT_DIR = os.path.join(parent_dir, "checkpoints", "sam-3d-body-dinov3")
@@ -56,7 +67,6 @@ ONNX_PATH = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3.onnx")
 TRT_PATH_BF16 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_bf16.engine")
 TRT_PATH_FP16 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_fp16.engine")
 TRT_PATH_INT8 = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_int8.engine")
-TRT_PATH = TRT_PATH_FP16  # Default to FP16 for better TensorRT optimization
 ONNX_QDQ_PATH = os.path.join(TRT_OUTPUT_DIR, "backbone_dinov3_qdq.onnx")
 
 # Model config
@@ -170,112 +180,29 @@ def step1_export_onnx(backbone, batch_sizes=[1, 2, 4]):
     return True
 
 
-import tensorrt as _trt_for_calib
-
-
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
-_IMAGENET_STD  = [0.229, 0.224, 0.225]
-
-# Default calibration video path (relative to project root)
-_DEFAULT_CALIB_VIDEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos", "sample_video.mp4")
+_IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-class _VideoCalibrator(_trt_for_calib.IInt8EntropyCalibrator2):
-    """INT8 calibrator using real video frames (ImageNet-normalized FP32)."""
-
-    def __init__(self, batch_size=1, video_path=None, num_frames=200):
-        super().__init__()
-        self._batch_size = batch_size
-        self._cache_file = os.path.join(TRT_OUTPUT_DIR, "int8_calibration.cache")
-
-        import cv2
-        if video_path is None:
-            video_path = _DEFAULT_CALIB_VIDEO
-
-        mean = torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1).cuda()
-        std  = torch.tensor(_IMAGENET_STD,  dtype=torch.float32).view(3, 1, 1).cuda()
-
-        cap = cv2.VideoCapture(video_path)
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        step = max(1, total // num_frames)
-        frames = []
-        for i in range(0, total, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (IMAGE_SIZE[1], IMAGE_SIZE[0]))
-            t = torch.from_numpy(frame).float().cuda().permute(2, 0, 1) / 255.0
-            t = (t - mean) / std
-            frames.append(t)
-            if len(frames) >= num_frames:
-                break
-        cap.release()
-        print(f"  [Calibrator] Loaded {len(frames)} frames from {video_path}")
-
-        all_frames = torch.stack(frames)  # [N, 3, H, W]
-        pad = (batch_size - len(all_frames) % batch_size) % batch_size
-        if pad > 0:
-            all_frames = torch.cat([all_frames, all_frames[:pad]], dim=0)
-        self._batches = [
-            all_frames[i:i + batch_size].contiguous()
-            for i in range(0, len(all_frames), batch_size)
-        ]
-        self._idx = 0
-
-    def get_batch_size(self):
-        return self._batch_size
-
-    def get_batch(self, names):
-        if self._idx >= len(self._batches):
-            return None
-        batch = self._batches[self._idx]
-        self._idx += 1
-        return [batch.data_ptr()]
-
-    def read_calibration_cache(self):
-        if os.path.exists(self._cache_file):
-            with open(self._cache_file, "rb") as f:
-                return f.read()
-        return None
-
-    def write_calibration_cache(self, cache):
-        with open(self._cache_file, "wb") as f:
-            f.write(cache)
-
-
-def _load_calib_frames(video_path=None, num_frames=200):
-    """Load calibration frames from video, ImageNet-normalized, on CUDA."""
-    import cv2
+def _load_calib_frames(video_path=None, num_frames=DEFAULT_NUM_CALIB_FRAMES):
+    """Load calibration frames as ImageNet-normalized FP32 [1, 3, H, W] CUDA tensors."""
     if video_path is None:
-        video_path = _DEFAULT_CALIB_VIDEO
+        video_path = DEFAULT_CALIB_VIDEO
 
     mean = torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1).cuda()
-    std  = torch.tensor(_IMAGENET_STD,  dtype=torch.float32).view(1, 3, 1, 1).cuda()
+    std = torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1).cuda()
 
-    cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    step = max(1, total // num_frames)
     frames = []
-    for i in range(0, total, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (IMAGE_SIZE[1], IMAGE_SIZE[0]))
+    for frame in sample_video_frames_rgb(
+        video_path, num_frames, width=IMAGE_SIZE[1], height=IMAGE_SIZE[0]
+    ):
         t = torch.from_numpy(frame).float().cuda().permute(2, 0, 1).unsqueeze(0) / 255.0
-        t = (t - mean) / std
-        frames.append(t)
-        if len(frames) >= num_frames:
-            break
-    cap.release()
+        frames.append((t - mean) / std)
     print(f"  [Calib] Loaded {len(frames)} frames from {video_path}")
     return frames
 
 
-def step2b_quantize_onnx(video_path=None, num_frames=200):
+def step2b_quantize_onnx(video_path=None, num_frames=DEFAULT_NUM_CALIB_FRAMES):
     """
     Explicit INT8 PTQ using nvidia-modelopt on PyTorch (CUDA).
 
@@ -346,7 +273,11 @@ def step2b_quantize_onnx(video_path=None, num_frames=200):
 
 
 def step2_convert_tensorrt(batch_sizes=[1, 2, 4], use_int8=False):
-    """Convert ONNX to TensorRT with FP16."""
+    """Convert ONNX to a TensorRT engine with FP16 I/O.
+
+    use_int8=False: FP16 engine from ONNX_PATH.
+    use_int8=True:  INT8+FP16 engine from the Q/DQ ONNX written by --quantize_onnx.
+    """
     out_path = TRT_PATH_INT8 if use_int8 else TRT_PATH_FP16
     precision_label = "INT8+FP16" if use_int8 else "FP16"
     print("\n" + "=" * 60)
@@ -406,26 +337,17 @@ def step2_convert_tensorrt(batch_sizes=[1, 2, 4], use_int8=False):
     # Always enable FP16 for layers that cannot run in INT8 (Softmax, LayerNorm, etc.)
     config.set_flag(trt.BuilderFlag.FP16)
 
+    # Force FP16 I/O for both precisions: TRTDinov3Backbone binds FP16 input/output buffers.
+    for i in range(network.num_inputs):
+        network.get_input(i).dtype = trt.float16
+    for i in range(network.num_outputs):
+        network.get_output(i).dtype = trt.float16
+
     if use_int8:
-        # Explicit quantization via Q/DQ nodes in ONNX - no calibrator needed
-        # TRT reads QuantizeLinear/DequantizeLinear nodes and uses INT8 for MatMul/Conv
+        # Explicit quantization: TRT picks INT8 kernels from the Q/DQ nodes, so no calibrator.
         config.set_flag(trt.BuilderFlag.INT8)
-        # Set I/O to FP16 (Q/DQ ONNX has FP32 I/O by ORT convention, but we want FP16)
-        for i in range(network.num_inputs):
-            inp = network.get_input(i)
-            inp.dtype = trt.float16
-        for i in range(network.num_outputs):
-            out = network.get_output(i)
-            out.dtype = trt.float16
         print("  Using explicit INT8 (Q/DQ ONNX) + FP16 fallback, FP16 I/O")
     else:
-        # Set input/output layers to use FP16
-        for i in range(network.num_inputs):
-            inp = network.get_input(i)
-            inp.dtype = trt.float16
-        for i in range(network.num_outputs):
-            out = network.get_output(i)
-            out.dtype = trt.float16
         print("  Using FP16 precision (compute + I/O)")
 
     # Optimization profile for dynamic batch size
@@ -505,9 +427,21 @@ class TRTBackbone:
         return output
 
 
+def _time_trt_ms_per_call(trt_backbone, x, warmup_iters=5, timed_iters=50):
+    """Mean wall-clock latency (ms) of a TRTBackbone call after warmup."""
+    for _ in range(warmup_iters):
+        _ = trt_backbone(x)
+    torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    for _ in range(timed_iters):
+        _ = trt_backbone(x)
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) * 1000 / timed_iters
+
+
 def step3_benchmark(backbone, save_results=True):
     """Benchmark PyTorch vs TensorRT."""
-    import datetime, json
     print("\n" + "=" * 60)
     print("Step 3: Benchmark")
     print("=" * 60)
@@ -545,18 +479,7 @@ def step3_benchmark(backbone, save_results=True):
         if os.path.exists(TRT_PATH_FP16):
             print("  [TensorRT FP16]")
             trt_backbone = TRTBackbone(TRT_PATH_FP16)
-
-            # Warmup
-            for _ in range(5):
-                _ = trt_backbone(x)
-            torch.cuda.synchronize()
-
-            # Benchmark
-            start = time.perf_counter()
-            for _ in range(50):
-                _ = trt_backbone(x)
-            torch.cuda.synchronize()
-            trt_time = (time.perf_counter() - start) * 1000 / 50
+            trt_time = _time_trt_ms_per_call(trt_backbone, x)
             print(f"    Time: {trt_time:.3f} ms/call")
             print(f"    Speedup: {pt_time / trt_time:.2f}x")
             batch_results["trt_fp16_ms"] = round(trt_time, 3)
@@ -578,16 +501,7 @@ def step3_benchmark(backbone, save_results=True):
         if os.path.exists(TRT_PATH_INT8):
             print("  [TensorRT INT8+FP16]")
             trt_backbone_int8 = TRTBackbone(TRT_PATH_INT8)
-
-            for _ in range(5):
-                _ = trt_backbone_int8(x)
-            torch.cuda.synchronize()
-
-            start = time.perf_counter()
-            for _ in range(50):
-                _ = trt_backbone_int8(x)
-            torch.cuda.synchronize()
-            int8_time = (time.perf_counter() - start) * 1000 / 50
+            int8_time = _time_trt_ms_per_call(trt_backbone_int8, x)
             print(f"    Time: {int8_time:.3f} ms/call")
             print(f"    Speedup vs PyTorch: {pt_time / int8_time:.2f}x")
             batch_results["trt_int8_ms"] = round(int8_time, 3)
@@ -600,7 +514,6 @@ def step3_benchmark(backbone, save_results=True):
         results["batch_sizes"][str(batch_size)] = batch_results
 
     if save_results:
-        import csv
         out_path = os.path.join(TRT_OUTPUT_DIR, "benchmark_results.csv")
         with open(out_path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -622,14 +535,15 @@ def main():
     parser = argparse.ArgumentParser(description="Convert DINOv3 Backbone to TensorRT")
     parser.add_argument("--export_onnx", action="store_true", help="Export to ONNX")
     parser.add_argument("--quantize_onnx", action="store_true",
-                        help="Explicit INT8 PTQ: add Q/DQ nodes to ONNX (ORT static quantization)")
+                        help="Explicit INT8 PTQ with nvidia-modelopt (INT8_DEFAULT_CFG, "
+                             "video calibration frames); exports a Q/DQ ONNX")
     parser.add_argument("--convert_trt", action="store_true", help="Convert ONNX to TensorRT")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark PyTorch vs TensorRT")
     parser.add_argument("--all", action="store_true", help="Run all steps")
     parser.add_argument("--int8", action="store_true",
                         help="Build INT8 engine from QDQ ONNX (run --quantize_onnx first)")
     parser.add_argument("--batch_sizes", type=str, default="1,2,4", help="Batch sizes for optimization")
-    parser.add_argument("--num_frames", type=int, default=200,
+    parser.add_argument("--num_frames", type=int, default=DEFAULT_NUM_CALIB_FRAMES,
                         help="Number of calibration frames from video")
 
     args = parser.parse_args()

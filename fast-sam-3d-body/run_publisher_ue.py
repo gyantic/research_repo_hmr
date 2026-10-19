@@ -20,9 +20,20 @@ run_publisher.py をベースに、ZMQ 配信に加えて UE への UDP/TCP 送�
         --mhr2smpl-mapping-path <mapping.npz> \\
         --ue tcp \\
         --local-port 5555
+
+使い方 (動画ファイル入力):
+    python run_publisher_ue.py \\
+        --source video --video <video.mp4> [--intrinsics <camera.json>] --no-loop \\
+        --nn-model-dir <model_dir> \\
+        --mhr2smpl-mapping-path <mapping.npz> \\
+        --ue udp
+    --intrinsics を省略した場合は FOV 推定器 (MoGe2) で内部パラメータを推定し、
+    重力方向は既定値 [0, 1, 0] を用いる。
 """
 
 import argparse
+import csv
+import datetime
 import os
 import sys
 import threading
@@ -39,8 +50,11 @@ os.environ.setdefault("GPU_HAND_PREP", "1")
 os.environ.setdefault("LAYER_DTYPE", "fp32")
 os.environ.setdefault("SKIP_KEYPOINT_PROMPT", "1")
 os.environ.setdefault("KEYPOINT_PROMPT_INTERM_INTERVAL", "999")
-os.environ.setdefault("IMG_SIZE", "512")
+# IMG_SIZE is not set here: build_default_estimator() overwrites it from
+# --image-size before the model reads it.
 os.environ.setdefault("MHR_NO_CORRECTIVES", "1")
+# FOV_* must be set here (not only in build_default_estimator) because
+# tools/build_fov_estimator reads them at import time.
 os.environ.setdefault("FOV_TRT", "1")
 os.environ.setdefault("FOV_TRT_PATH", "./checkpoints/moge_trt/moge_dinov2_encoder_int8.engine")
 os.environ.setdefault("FOV_FAST", "1")
@@ -239,9 +253,6 @@ class RealtimePublisherUE:
         self.publish_thread = None
         self.recording_thread = None
 
-        self.first_capture_ts = None
-        self.first_infer_ts = None
-
         self.stats = {
             "capture_count": 0,
             "dropped_capture_count": 0,
@@ -257,7 +268,6 @@ class RealtimePublisherUE:
             "backbone_times_ms": deque(maxlen=100),
             "decoders_times_ms": deque(maxlen=100),
             "detection_times_ms": deque(maxlen=100),
-            "fov_times_ms": deque(maxlen=100),
             "frame_stats": [],
             "ue_send_count": 0,
         }
@@ -316,9 +326,6 @@ class RealtimePublisherUE:
             if frame_timestamp is None:
                 continue
 
-            if self.first_capture_ts is None:
-                self.first_capture_ts = frame_timestamp
-
             if self._capture_wall_base is None:
                 self._capture_wall_base = time.perf_counter()
                 self._capture_ts_base = frame_timestamp
@@ -363,9 +370,6 @@ class RealtimePublisherUE:
 
             frame, frame_timestamp = item
 
-            if self.first_infer_ts is None:
-                self.first_infer_ts = frame_timestamp
-
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             t_infer_start = time.perf_counter()
@@ -386,7 +390,6 @@ class RealtimePublisherUE:
                 self.stats["backbone_times_ms"].append(t.get("backbone_ms", 0))
                 self.stats["decoders_times_ms"].append(t.get("decoders_ms", 0))
                 self.stats["detection_times_ms"].append(t.get("detection_ms", 0))
-                self.stats["fov_times_ms"].append(t.get("fov_ms", 0))
 
             num_persons = len(outputs)
             frame_stat = {
@@ -445,16 +448,14 @@ class RealtimePublisherUE:
             convert_ms = convert_dt * 1000.0
             frame_stat["convert_ms"] = convert_ms
 
-            # ZMQ interpolator に root_trans (pred_cam_t) も渡す
             self.interpolator.add_pose(
                 frame_timestamp,
                 body_quat,
                 smpl_joints,
                 smpl_pose_pub,
-                root_trans=pred_cam_t,
             )
 
-            # UE 即時送信 (推論完了直後)
+            # UE には補間を介さず推論完了直後に送信する (ZMQ は _publish_loop で補間配信)
             if self.ue_sender is not None and self.ue_sender.is_connected:
                 t_send = time.perf_counter()
                 self.ue_sender.send(
@@ -570,64 +571,53 @@ class RealtimePublisherUE:
         self._live_prev_stats = curr
         self._live_last_log_perf = now_perf
 
+    def _drain_smpl_queue(self):
+        """Move every queued SMPL pose into smpl_data_list without blocking."""
+        while True:
+            try:
+                smpl_ts, body_quat, smpl_joints, smpl_pose = (
+                    self.smpl_queue.get_nowait()
+                )
+            except queue.Empty:
+                return
+            self.smpl_data_list.append(
+                {
+                    "timestamp": smpl_ts,
+                    "body_quat": body_quat,
+                    "smpl_joints": smpl_joints,
+                    "smpl_pose": smpl_pose,
+                }
+            )
+
     def _recording_loop(self):
         video_writer = None
         fps = self.video_source.fps
         while self.running:
             try:
-                frame_ts, frame = self.video_queue.get(timeout=0.05)
+                _frame_ts, frame = self.video_queue.get(timeout=0.05)
                 if video_writer is None:
                     h, w = frame.shape[:2]
                     fourcc = cv2.VideoWriter_fourcc(*"avc1")
                     video_writer = cv2.VideoWriter(
                         self.video_out_path, fourcc, fps, (w, h)
                     )
-                if video_writer is not None:
-                    video_writer.write(frame)
+                video_writer.write(frame)
             except queue.Empty:
                 pass
 
-            try:
-                while True:
-                    smpl_ts, body_quat, smpl_joints, smpl_pose = (
-                        self.smpl_queue.get_nowait()
-                    )
-                    self.smpl_data_list.append(
-                        {
-                            "timestamp": smpl_ts,
-                            "body_quat": body_quat,
-                            "smpl_joints": smpl_joints,
-                            "smpl_pose": smpl_pose,
-                        }
-                    )
-            except queue.Empty:
-                pass
+            self._drain_smpl_queue()
 
         if self.record:
             logger.info("Flushing recording queues to disk. Please wait...")
             while not self.video_queue.empty():
                 try:
-                    frame_ts, frame = self.video_queue.get_nowait()
+                    _frame_ts, frame = self.video_queue.get_nowait()
                     if video_writer is not None:
                         video_writer.write(frame)
                 except queue.Empty:
                     break
 
-            while not self.smpl_queue.empty():
-                try:
-                    smpl_ts, body_quat, smpl_joints, smpl_pose = (
-                        self.smpl_queue.get_nowait()
-                    )
-                    self.smpl_data_list.append(
-                        {
-                            "timestamp": smpl_ts,
-                            "body_quat": body_quat,
-                            "smpl_joints": smpl_joints,
-                            "smpl_pose": smpl_pose,
-                        }
-                    )
-                except queue.Empty:
-                    break
+            self._drain_smpl_queue()
 
             if video_writer is not None:
                 video_writer.release()
@@ -674,17 +664,11 @@ class RealtimePublisherUE:
             result = self.interpolator.interpolate(query_ts)
             used_fallback = False
             if result is None:
-                latest = self.interpolator.get_latest_pose()
-                if latest is not None:
-                    # get_latest_pose は (body_quat, smpl_joints, smpl_pose) の 3 タプルを返す
-                    result = (*latest, None)
-                    used_fallback = True
+                result = self.interpolator.get_latest_pose()
+                used_fallback = result is not None
 
             if result is not None and self._publish_enabled:
-                body_quat, smpl_joints, smpl_pose, _root_trans = result
-
-                # ZMQ 配信 (既存プロトコル)
-                self.publisher.publish(body_quat, smpl_joints, smpl_pose)
+                self.publisher.publish(*result)
                 self.stats["publish_count"] += 1
                 if used_fallback:
                     self.stats["publish_fallback_count"] += 1
@@ -693,7 +677,6 @@ class RealtimePublisherUE:
                 if last_publish is not None:
                     self.stats["publish_intervals"].append(now_perf - last_publish)
                 last_publish = now_perf
-
 
             next_publish += self.publish_dt
             if next_publish < now_perf - self.publish_dt:
@@ -740,8 +723,6 @@ class RealtimePublisherUE:
         self._final_stats_logged = True
 
     def _save_stats_csv(self):
-        import csv, datetime
-
         def finite_array(values):
             arr = np.asarray(values, dtype=np.float64)
             return arr[np.isfinite(arr)]
@@ -803,7 +784,6 @@ class RealtimePublisherUE:
         convert_ms_values = [row.get("convert_ms", np.nan) for row in sent_rows]
         send_ms_values = [row.get("send_ms", np.nan) for row in sent_rows]
 
-        os.makedirs("output", exist_ok=True)
         path = prepare_csv_path(self.summary_csv or "output/benchmark_stats.csv")
         backbone_path = os.environ.get("TRT_BACKBONE_PATH", "")
         fov_path = os.environ.get("FOV_TRT_PATH", "")
@@ -1009,7 +989,11 @@ def main():
     parser.add_argument(
         "--intrinsics",
         type=str,
-        help="Camera intrinsics JSON path (required for --source video)",
+        help=(
+            "Camera intrinsics JSON path (optional, --source video only). "
+            "If omitted, intrinsics come from the FOV estimator and gravity "
+            "defaults to [0, 1, 0]"
+        ),
     )
     parser.add_argument(
         "--no-loop",
@@ -1045,8 +1029,8 @@ def main():
     parser.add_argument(
         "--smpl-model-path",
         type=str,
-        required=True,
-        help="SMPL model pickle file",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "body_models", "smpl", "SMPL_NEUTRAL.pkl"),
+        help="SMPL model pickle file (default: body_models/smpl/SMPL_NEUTRAL.pkl)",
     )
     parser.add_argument(
         "--nn-model-dir",
@@ -1145,7 +1129,7 @@ def main():
         )
         logger.info(
             f"UE sender ({args.ue.upper()}) created. "
-            f"Waiting for connection in background..."
+            "Blocking until UE connects (UDP: HELLO packet, TCP: accept)..."
         )
         ue_sender.wait_for_connection()
 

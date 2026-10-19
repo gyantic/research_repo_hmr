@@ -307,7 +307,6 @@ def main():
             mesh_times.append(time.time() - start_time)
             saver(outputs, frame_path, prefix=f'_{model_id}_{args.center_thresh}')
         average_mesh_time = sum(mesh_times) / len(mesh_times)
-        max_mesh_time = max(mesh_times)
         print(f"平均メッシュ生成時間：{average_mesh_time}\n")
         
         save_video_results(saver.frame_save_paths)

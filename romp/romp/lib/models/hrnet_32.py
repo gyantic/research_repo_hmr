@@ -223,52 +223,8 @@ blocks_dict = {
     'BOTTLENECK': Bottleneck
 }
 
-"""
 if __name__ == '__main__':
     model = HigherResolutionNet().cuda()
     a=model(torch.rand(2,512,512,3).cuda())
     for i in a:
         print(i.shape)
-"""
-if __name__ == '__main__':
-    import time
-    import torch.nn as nn
-    from config import args as _args
-
-    torch.backends.cudnn.benchmark = True
-    H, W = 512, 512
-    batch = 1
-    n_iter = 50
-
-    cfg = _args()  # グローバル設定オブジェクトを取得
-
-    for mode in ['fp32', 'fp16']:
-        print('===', mode, '===')
-
-        # forward 内の分岐と揃える
-        cfg.model_precision = mode
-
-        model = HigherResolutionNet().cuda().eval()
-
-        if mode == 'fp32':
-            # モデルは fp32 のまま
-            x = torch.rand(batch, H, W, 3, device='cuda', dtype=torch.float32)
-        else:
-            # モデルも入力も fp16 に揃える
-            model.half()
-            x = torch.rand(batch, H, W, 3, device='cuda', dtype=torch.float16)
-
-        # warmup
-        with torch.no_grad():
-            for _ in range(10):
-                y = model(x)
-
-        torch.cuda.synchronize()
-        t0 = time.time()
-        with torch.no_grad():
-            for _ in range(n_iter):
-                y = model(x)
-        torch.cuda.synchronize()
-        dt = (time.time() - t0) / n_iter
-        print('time per iter [ms]:', dt * 1000)
-

@@ -1,5 +1,4 @@
 import socket
-import threading
 
 import numpy as np
 from loguru import logger
@@ -69,14 +68,6 @@ class UESender:
         else:
             self._wait_tcp()
         self.is_connected = True
-
-    def wait_for_connection_async(self) -> None:
-        """バックグラウンドスレッドで接続を待機する（ノンブロッキング）。
-
-        接続が確立すると `is_connected` が True になる。
-        """
-        t = threading.Thread(target=self.wait_for_connection, daemon=True)
-        t.start()
 
     def _wait_udp(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

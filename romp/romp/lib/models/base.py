@@ -31,17 +31,8 @@ class Base(nn.Module):
             raise NotImplementedError('forward mode is not recognized! please set proper mode (parsing/matching_gts)')
 
     def matching_forward(self, meta_data, **cfg):
-        """
-        if args().model_precision=='fp16':
-            with autocast():
-                outputs = self.feed_forward(meta_data)
-                outputs, meta_data = self._result_parser.matching_forward(outputs, meta_data, cfg)
-        else:
-            outputs = self.feed_forward(meta_data)
-            outputs, meta_data = self._result_parser.matching_forward(outputs, meta_data, cfg)
-        """
         outputs = self.feed_forward(meta_data)
-        outputs, meta_data = self._result_parser.matching_forward(outputs, meta_data, cfg)    
+        outputs, meta_data = self._result_parser.matching_forward(outputs, meta_data, cfg)
         outputs['meta_data'] = meta_data
         if cfg['calc_loss']:
             outputs.update(self._calc_loss(outputs))
@@ -50,45 +41,24 @@ class Base(nn.Module):
 
     @torch.no_grad()
     def parsing_forward(self, meta_data, **cfg):
-        """
-        if args().model_precision=='fp16':
-            with autocast():
-                outputs = self.feed_forward(meta_data)
-                outputs, meta_data = self._result_parser.parsing_forward(outputs, meta_data, cfg)
-        else:
-            outputs = self.feed_forward(meta_data)
-            outputs, meta_data = self._result_parser.parsing_forward(outputs, meta_data, cfg)
-        """
         outputs = self.feed_forward(meta_data)
         outputs, meta_data = self._result_parser.parsing_forward(outputs, meta_data, cfg)
         outputs['meta_data'] = meta_data
         #print_dict(outputs)
         return outputs
-    
-    """
-    def feed_forward(self, meta_data):
-        x = self.backbone(meta_data['image'].contiguous().cuda())
-        outputs = self.head_forward(x)
-        return outputs
-    """
+
     def feed_forward(self, meta_data):
         img = meta_data['image'].contiguous().cuda(non_blocking=True)
-        _dtype = next(self.parameters()).dtype
-        if _dtype != torch.float32:
-            img = img.to(_dtype)
+        # No autocast: cast the input to the (first) parameter dtype for bf16/fp16 runs.
+        model_dtype = next(self.parameters()).dtype
+        if model_dtype != torch.float32:
+            img = img.to(model_dtype)
         x = self.backbone(img)
         outputs = self.head_forward(x)
         return outputs
 
     @torch.no_grad()
     def pure_forward(self, meta_data, **cfg):
-        """
-        if args().model_precision=='fp16':
-            with autocast():
-                outputs = self.feed_forward(meta_data)
-        else:
-            outputs = self.feed_forward(meta_data)
-        """
         outputs = self.feed_forward(meta_data)
         return outputs
 

@@ -19,7 +19,10 @@ yaml_timestamp = os.path.abspath(os.path.join(project_dir, 'active_configs' + os
 
 model_dir = os.path.join(project_dir,'model_data')
 trained_model_dir = os.path.join(project_dir,'trained_models')
-smpl_model_dir = os.path.join(os.path.expanduser("~"),'.romp')
+# SMPL はリポジトリ直下の body_models/smpl/ に1か所だけ置く（SAT-HMR・Fast-SAM-3D-Body と共用）
+smpl_model_dir = os.path.join(os.path.dirname(project_dir),'body_models','smpl')
+if not os.path.exists(os.path.join(smpl_model_dir,'SMPL_NEUTRAL.pth')):
+    smpl_model_dir = os.path.join(os.path.expanduser("~"),'.romp')
 if not os.path.exists(smpl_model_dir):
     smpl_model_dir = os.path.join(model_dir,'smpl_models')
 
@@ -267,6 +270,7 @@ class ConfigContext(object):
         # if a yaml is left over here, remove it
         self.clean()
         # store all the parsed_args in a yaml file
+        os.makedirs(os.path.dirname(os.path.abspath(self.yaml_filename)), exist_ok=True)
         with open(self.yaml_filename, 'w') as f:
             d = self.parsed_args.__dict__
             yaml.dump(d, f)
@@ -277,6 +281,7 @@ class ConfigContext(object):
         self.yaml_filename = filepath
         self.clean()
         # store all the parsed_args in a yaml file
+        os.makedirs(os.path.dirname(os.path.abspath(self.yaml_filename)), exist_ok=True)
         with open(self.yaml_filename, 'w') as f:
             d = self.parsed_args.__dict__
             yaml.dump(d, f)

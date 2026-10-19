@@ -1,10 +1,5 @@
-import sys 
+import sys
 import time
-import os
-import random
-import numpy as np
-import cv2
-import torch
 
 whether_set_yml = ['configs_yml' in input_arg for input_arg in sys.argv]
 if sum(whether_set_yml)==0:
@@ -12,26 +7,8 @@ if sum(whether_set_yml)==0:
     print('No configs_yml is set, set it to the default {}'.format(default_webcam_configs_yml))
     sys.argv.append(default_webcam_configs_yml)
 
-SEED = 42
-
-
-def setup_reproducibility(seed: int = 42):
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    random.seed(seed)
-    np.random.seed(seed)
-    cv2.setRNGSeed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
+# Seed and force deterministic kernels before the model modules are imported/built.
+from ..reproducibility import SEED, setup_reproducibility
 setup_reproducibility(SEED)
 
 from .image import *
@@ -97,13 +74,12 @@ class Video_processor(Image_processor):
             visualizer = Vedo_visualizer()
             stand_on_imgs_frames = []
         
-        mesh_generation_times = []  # メッシュ生成時間を格納するリスト
+        mesh_generation_times = []  # seconds per net_forward call
 
         for test_iter,meta_data in enumerate(internet_loader):
             start_time = time.time()
             outputs = self.net_forward(meta_data, cfg=self.demo_cfg)
-            mesh_time = time.time() - start_time
-            mesh_generation_times.append(mesh_time) 
+            mesh_generation_times.append(time.time() - start_time)
             reorganize_idx = outputs['reorganize_idx'].cpu().numpy()
             counter.count(self.val_batch_size)
             results = self.reorganize_results(outputs, outputs['meta_data']['imgpath'], reorganize_idx)
@@ -218,12 +194,9 @@ class Video_processor(Image_processor):
             video_save_name = os.path.join(self.output_dir, video_basename+'_soi_results.mp4')
             print('Writing results to {}'.format(video_save_name))
             frames2video(stand_on_imgs_frames, video_save_name, fps=self.fps_save)
-        print(f"平均メッシュ生成時間: {sum(mesh_generation_times)/len(mesh_generation_times):.4f}秒")
-        max_time = max(mesh_generation_times)
-        avg_time = sum(mesh_generation_times) / len(mesh_generation_times)
-
-        print(f"メッシュ生成の最大時間（ピーク）: {max_time:.4f}秒")
-        print(f"メッシュ生成の平均時間: {avg_time:.4f}秒")
+        mean_mesh_time_s = sum(mesh_generation_times) / len(mesh_generation_times)
+        print(f"メッシュ生成の平均時間: {mean_mesh_time_s:.4f}秒")
+        print(f"メッシュ生成の最大時間（ピーク）: {max(mesh_generation_times):.4f}秒")
         return results_frames
 
 

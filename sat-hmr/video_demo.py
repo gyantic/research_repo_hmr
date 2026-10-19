@@ -1,14 +1,12 @@
 """
 SAT-HMR Video Demo
 動画ファイルを入力として、3Dメッシュ推定を行い、結果を動画として出力します。
-"""
 
-"""
-args：
--i 入力動画ファイル名(これは必須)
--o 出力動画ファイル名(ないなら入力名_sathmr.mp4)
---conf_thresh：検出信頼度閾値 (デフォルト 0.3)
---no_save 保存しないならTrue
+主な引数:
+  -i 入力動画ファイル名 (必須)
+  -o 出力動画ファイル名 (省略時は 入力名_sathmr.mp4)
+  --conf_thresh 検出信頼度閾値 (デフォルト 0.3)
+  --no_save 動画を保存しない
 """
 
 import argparse
@@ -18,34 +16,22 @@ import logging
 import os
 import socket
 import sys
-import random
 import time
 from types import MethodType
 
 # --- xformers無効化 / INT8 attention有効化の環境変数セット ---
 # models import前に必ず立てる必要があるため argparse より前で sys.argv を peek する。
 _ARGV = sys.argv[1:]
-def _ptq_mode_from_argv(argv):
-    for i, a in enumerate(argv):
-        if a == "--ptq_mode" and i + 1 < len(argv):
-            return argv[i + 1]
-        if a.startswith("--ptq_mode="):
-            return a.split("=", 1)[1]
-    if "--torchao_int8" in argv:
-        return "int8_dynamic"
-    return "none"
-_PTQ_MODE_PEEK = _ptq_mode_from_argv(_ARGV)
-_PTQ_ACTIVE = _PTQ_MODE_PEEK != "none"
-_NO_INT8_ATTN = "--no_int8_attn" in _ARGV
 if "--xformers_off" in _ARGV:
     os.environ.setdefault("XFORMERS_DISABLED", "1")
-if _NO_INT8_ATTN:
+if "--no_int8_attn" in _ARGV:
     os.environ.pop("SAT_HMR_INT8_ATTENTION", None)
 elif "--int8_attn" in _ARGV:
     os.environ.setdefault("SAT_HMR_INT8_ATTENTION", "1")
 
 
 def split_torch_logs_out_per_run():
+    """Give each run its own TORCH_LOGS_OUT file (<root>.<timestamp>.<pid><ext>) so runs do not overwrite each other."""
     log_path = os.environ.get("TORCH_LOGS_OUT")
     if not log_path:
         return None
@@ -61,7 +47,8 @@ def split_torch_logs_out_per_run():
     return split_path
 
 
-_SPLIT_TORCH_LOGS_OUT = split_torch_logs_out_per_run()
+# Must run before torch is imported: torch reads TORCH_LOGS_OUT at import time.
+split_torch_logs_out_per_run()
 
 
 def _argv_value(argv, *names):
@@ -92,31 +79,6 @@ def _run_log_dir_from_argv(argv):
         if path_dir and path_dir != os.path.sep:
             return path_dir
     return os.path.join("plots", "run_logs")
-
-
-def dequantize_int8_weight_state_dict_if_needed(state_dict):
-    int8_keys = [k for k in state_dict if k.endswith(".weight_int8")]
-    if not int8_keys:
-        return state_dict, {"loaded_int8_weight_file": False, "dequantized_tensors": 0}
-
-    restored = {}
-    for key, tensor in state_dict.items():
-        if key.endswith(".weight_int8"):
-            base = key[: -len("_int8")]
-            scale_key = base + "_scale"
-            if scale_key not in state_dict:
-                raise KeyError(f"Missing INT8 weight scale for {key}: expected {scale_key}")
-            scale = state_dict[scale_key].float().unsqueeze(1)
-            restored[base] = tensor.float() * scale
-        elif key.endswith(".weight_scale"):
-            continue
-        else:
-            restored[key] = tensor
-
-    return restored, {
-        "loaded_int8_weight_file": True,
-        "dequantized_tensors": len(int8_keys),
-    }
 
 
 class TeeStream:
@@ -153,7 +115,6 @@ def setup_run_log(argv):
 
 _RUN_LOG_PATH = setup_run_log(_ARGV)
 
-import yaml
 import cv2
 import numpy as np
 import torch
@@ -162,6 +123,12 @@ from tqdm import tqdm
 
 
 def patch_inductor_same_meta():
+    """Make Inductor's post-grad same_meta() tolerate nodes without a tensor "val" meta.
+
+    The stock helper assumes both nodes carry a sized "val" meta; some nodes (e.g.
+    around torchao quantized tensor subclasses) may not. Such pairs are treated as
+    "not the same" instead of raising.
+    """
     import torch._inductor.fx_passes.post_grad as pg
 
     orig_same_meta = pg.same_meta
@@ -179,13 +146,20 @@ def patch_inductor_same_meta():
 
 
 patch_inductor_same_meta()
-from PIL import Image
-from scipy.spatial.transform import Rotation
-from torchvision import transforms
 
 from models import build_sat_model
 from utils.transforms import unNormalize
 from utils.visualization import tensor_to_BGR, pad_img, vis_meshes_img, get_colors_rgb
+from sathmr_common import (
+    dequantize_int8_weight_state_dict_if_needed,
+    is_bf16,
+    load_config,
+    preprocess_frame,
+    select_udp_target,
+    setup_reproducibility,
+    smpl_pose_to_ue_quaternions,
+    transl_to_ue,
+)
 
 SEED = 42
 DTYPE_DEBUG_ONCE = {
@@ -193,23 +167,6 @@ DTYPE_DEBUG_ONCE = {
     'img': False,
     'smpl': False,
 }
-
-
-def setup_reproducibility(seed: int = 42):
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    random.seed(seed)
-    np.random.seed(seed)
-    cv2.setRNGSeed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 setup_reproducibility(SEED)
@@ -296,7 +253,7 @@ def wrap_quantized_linears_for_compile(model):
 
 def get_args():
     parser = argparse.ArgumentParser('SAT-HMR Video Demo')
-    parser.add_argument('--input', '-i', required=True, help='入力動画ファイルパス') #"/videos/sample_video.mp4"
+    parser.add_argument('--input', '-i', required=True, help='入力動画ファイルパス')
     parser.add_argument('--output', '-o', default=None, help='出力動画ファイルパス')
     parser.add_argument('--output_dir', default=None, help='出力ファイルを置くディレクトリ')
     parser.add_argument('--log_dir', default=None, help='実行ログを置くディレクトリ')
@@ -400,139 +357,6 @@ def resolve_output_path(path, output_dir, label, root_filename_dir=None):
     return path
 
 
-def load_config(input_size):
-    demo_cfg_path = os.path.join('configs', 'run', 'demo.yaml')
-    with open(demo_cfg_path) as f:
-        demo_config = yaml.safe_load(f)
-    
-    model_name = demo_config.get('model', 'default')
-    model_cfg_path = os.path.join('configs', 'models', f'{model_name}.yaml')
-    with open(model_cfg_path) as f:
-        model_config = yaml.safe_load(f)
-    
-    class Config:
-        pass
-    
-    args = Config()
-    for k, v in model_config.items():
-        setattr(args, k, v)
-    for k, v in demo_config.items():
-        setattr(args, k, v)
-    
-    args.mode = 'infer'
-    args.pretrain = False
-    args.pretrain_path = None
-    args.input_size = input_size
-    
-    return args
-
-
-def process_img_like_base(img, input_size):
-    """BASEクラスのprocess_imgと同じ処理"""
-    ori_h, ori_w = img.shape[:2]
-    
-    # 長い辺をinput_sizeに合わせる
-    if ori_w >= ori_h:
-        resize_rate = input_size / ori_w
-        new_w = input_size
-        new_h = int(resize_rate * ori_h)
-    else:
-        resize_rate = input_size / ori_h
-        new_h = input_size
-        new_w = int(resize_rate * ori_w)
-    
-    img_resized = cv2.resize(img, (new_w, new_h))
-    img_size = (new_h, new_w)
-    
-    return img_resized, img_size, resize_rate
-
-
-def preprocess_frame(frame, input_size, use_sat=True):
-    """フレームを前処理（BASEクラスの__getitem__と同じ処理）"""
-    # BGR画像をそのまま使用（process_imgと同じ）
-    img_resized, img_size, resize_rate = process_img_like_base(frame, input_size)
-    
-    # パディング（__getitem__と同じ）
-    patch_size = 56 if use_sat else 14
-    pad_h = (img_size[0] + patch_size - 1) // patch_size * patch_size
-    pad_w = (img_size[1] + patch_size - 1) // patch_size * patch_size
-    
-    pad_img = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-    pad_img[:img_size[0], :img_size[1]] = img_resized
-    
-    # BGR -> RGB, PIL変換, 正規化
-    pil_img = Image.fromarray(pad_img[:, :, ::-1].copy())
-    
-    array2tensor = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-    
-    norm_img = array2tensor(pil_img)
-    return norm_img, img_size, frame.shape[:2]
-
-
-def smpl_pose_to_ue_quaternions(pose):
-    rotations = Rotation.from_rotvec(pose.reshape(-1, 3))
-    quaternions = rotations.as_quat().astype(np.float32)
-    quaternions[:, 0] *= -1.0
-    quaternions[:, 2] *= -1.0
-    flip_root = np.array([1., 0., 0., 0.], dtype=np.float32)
-    quaternions[0] = (
-        Rotation.from_quat(flip_root) * Rotation.from_quat(quaternions[0])
-    ).as_quat().astype(np.float32)
-    return quaternions
-
-
-def transl_to_ue(transl):
-    trans = transl.copy().astype(np.float32)
-    trans[1] *= -1.0
-    trans[2] = 0.0
-    return trans * 100.0
-
-
-def select_udp_target(cands, tracker_state, max_dist_cm, reinit_conf):
-    if len(cands['confs']) == 0:
-        return None, tracker_state, None
-
-    confs = cands['confs']
-    poses = cands['poses']
-    transls = cands['transls']
-    query_ids = cands['query_ids']
-
-    best_idx = int(np.argmax(confs))
-    reason = "max_conf"
-
-    if tracker_state['active'] and tracker_state['transl'] is not None:
-        dists_cm = np.linalg.norm(transls - tracker_state['transl'][None, :], axis=1) * 100.0
-        near_idx = int(np.argmin(dists_cm))
-        near_dist = float(dists_cm[near_idx])
-        near_conf = float(confs[near_idx])
-        best_conf = float(confs[best_idx])
-
-        if near_dist <= max_dist_cm:
-            best_idx = near_idx
-            reason = f"nearest:{near_dist:.1f}cm"
-        elif best_conf >= reinit_conf:
-            reason = f"reinit_conf:{best_conf:.3f}"
-        else:
-            return None, tracker_state, f"skip_jump nearest={near_dist:.1f}cm conf={near_conf:.3f}"
-
-    selected = {
-        'pose': poses[best_idx],
-        'transl': transls[best_idx],
-        'conf': float(confs[best_idx]),
-        'query_id': int(query_ids[best_idx]),
-        'num_persons': len(confs),
-    }
-
-    tracker_state['active'] = True
-    tracker_state['transl'] = transls[best_idx].copy()
-    tracker_state['query_id'] = int(query_ids[best_idx])
-    tracker_state['missed'] = 0
-    return selected, tracker_state, reason
-
-
 def _postprocess_and_render(
     model,
     outputs,
@@ -581,7 +405,6 @@ def _postprocess_and_render(
             ],
             dtype=torch.float32,
         )
-    #pred_intrinsics_np = pred_intrinsics.numpy().astype(np.float32)
     pred_intrinsics_np = pred_intrinsics.float().cpu().numpy().astype(np.float32)
 
     if num_persons > 0:
@@ -599,7 +422,7 @@ def _postprocess_and_render(
         }
 
         with torch.no_grad():
-            use_bf16 = str(dtype).lower() in {"bfloat16", "bf16", "bfp16"}
+            use_bf16 = is_bf16(dtype)
             tensor_dtype = torch.bfloat16 if use_bf16 else torch.float32
             poses_dev = torch.from_numpy(poses_t).to(device=device, dtype=tensor_dtype, non_blocking=True)
             betas_dev = torch.from_numpy(betas_t).to(device=device, dtype=tensor_dtype, non_blocking=True)
@@ -664,7 +487,7 @@ def _postprocess_and_render(
 def process_frame(model, frame, input_size, conf_thresh, device, no_render=False, dtype="FP32"):
     """1フレームを処理"""
     times = {}
-    use_bf16 = str(dtype).lower() in {"bfloat16", "bf16", "bfp16"}
+    use_bf16 = is_bf16(dtype)
 
     # 前処理
     t0 = time.time()
@@ -710,7 +533,7 @@ def process_frame(model, frame, input_size, conf_thresh, device, no_render=False
 
 def process_frames_batch(model, frames, input_size, conf_thresh, device, no_render=False, dtype="FP32"):
     """複数フレームを1バッチで推論"""
-    use_bf16 = str(dtype).lower() in {"bfloat16", "bf16", "bfp16"}
+    use_bf16 = is_bf16(dtype)
     batch_items = []
     for frame in frames:
         t0 = time.time()
@@ -791,7 +614,7 @@ def run_prewarm_frames(cap, model, args, device, dtype, total_frames):
     )
 
     done = 0
-    for idx in range(prewarm_n):
+    for _ in range(prewarm_n):
         ret, frame = cap.read()
         if not ret:
             print(f"[WARN] prewarm stopped early: {done}/{prewarm_n} frame(s)")
@@ -828,6 +651,118 @@ def run_prewarm_frames(cap, model, args, device, dtype, total_frames):
     return done
 
 
+FPS_WINDOW_FRAMES = 30
+PRED_RECORD_KEYS = ('joints2d', 'joints3d', 'verts', 'transl', 'bboxes', 'focal_length')
+
+
+def append_pred_record(pred_store, frame_idx, input_path, num_persons, pred_record):
+    """Accumulate one frame of predictions for the --pred_npz output."""
+    pred_store['frame_ids'].append(frame_idx)
+    pred_store['image_paths'].append(f"{input_path}#frame_{frame_idx:06d}")
+    pred_store['person_counts'].append(num_persons)
+    for key in PRED_RECORD_KEYS:
+        pred_store[key].append(pred_record[key])
+
+
+def update_fps_window(fps_queue, current_fps):
+    """Push current_fps into the sliding window and return the window average."""
+    fps_queue.append(current_fps)
+    if len(fps_queue) > FPS_WINDOW_FRAMES:
+        fps_queue.pop(0)
+    return float(np.mean(fps_queue)) if fps_queue else 0.0
+
+
+def metrics_csv_row(frame_idx, num_persons, times, elapsed_s, current_fps, avg_fps_30, udp_enabled):
+    return [
+        frame_idx,
+        num_persons,
+        f'{times["preprocess"] * 1000.0:.4f}',
+        f'{times["inference"] * 1000.0:.4f}',
+        f'{times["postprocess"] * 1000.0:.4f}',
+        f'{times["render"] * 1000.0:.4f}' if 'render' in times else '',
+        f'{elapsed_s * 1000.0:.4f}',
+        f'{current_fps:.6f}',
+        f'{avg_fps_30:.6f}',
+        udp_enabled,
+    ]
+
+
+def draw_timing_overlay(result_frame, current_fps, num_persons, times):
+    cv2.putText(result_frame, f"FPS: {current_fps:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(result_frame, f"Persons: {num_persons}", (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    y_offset = 110
+    cv2.putText(result_frame, f"Preprocess: {times['preprocess']*1000:.1f}ms", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    y_offset += 30
+    cv2.putText(result_frame, f"Inference: {times['inference']*1000:.1f}ms", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    y_offset += 30
+    cv2.putText(result_frame, f"Postprocess: {times['postprocess']*1000:.1f}ms", (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    if 'render' in times:
+        y_offset += 30
+        cv2.putText(result_frame, f"Render: {times['render']*1000:.1f}ms", (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+
+def print_frame_status(frame_idx, total_frames, current_fps, num_persons, times):
+    render_ms = f"{times['render']*1000:.0f}ms" if 'render' in times else 'skip'
+    print(
+        f"Frame: {frame_idx}/{total_frames} | FPS: {current_fps:.1f} | Persons: {num_persons} | "
+        f"Preprocess: {times['preprocess']*1000:.0f}ms | "
+        f"Inference: {times['inference']*1000:.0f}ms | "
+        f"Postprocess: {times['postprocess']*1000:.0f}ms | "
+        f"Render: {render_ms}"
+    )
+
+
+def print_first_frame_done(frame_idx, processing_start_time, times):
+    total_startup_time = time.perf_counter() - processing_start_time
+    print(
+        f"[INFO] First frame completed: frame={frame_idx} "
+        f"total={total_startup_time:.4f}s "
+        f"inference={times['inference'] * 1000.0:.1f}ms"
+    )
+
+
+def read_calibration_frames(video_path, num_frames):
+    """Read up to num_frames frames from the start of the video with a separate capture."""
+    calib_cap = cv2.VideoCapture(video_path)
+    frames = []
+    for _ in range(num_frames):
+        ok, frame = calib_cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+    calib_cap.release()
+    return frames
+
+
+def run_calibration_forward(model, frames, input_size, device, use_bf16):
+    """Forward calibration frames so that registered hooks can record activation ranges.
+
+    model.eval() is normally called later in main(); force eval mode here to skip
+    training-only paths (DN, prepare_for_cdn), then restore the previous mode.
+    """
+    prev_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for frame in frames:
+            img_tensor, img_size, _orig_size = preprocess_frame(frame, input_size, use_sat=True)
+            img_tensor = img_tensor.to(device)
+            if use_bf16:
+                img_tensor = img_tensor.to(torch.bfloat16)
+            targets = [{
+                'img_size': torch.tensor(img_size).to(device),
+                'img_path': 'calibration',
+            }]
+            model([img_tensor], targets)
+    if prev_training:
+        model.train()
+
+
 def main():
     args = get_args()
 
@@ -843,8 +778,8 @@ def main():
         args.no_render = True
         args.display = False
         args.show_fps = False
-    dtype = args.dtype_cfg #bfloat16
-    use_bf16 = str(dtype).lower() in {"bfloat16", "bf16", "bfp16"}
+    dtype = args.dtype_cfg
+    use_bf16 = is_bf16(dtype)
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():
@@ -887,7 +822,6 @@ def main():
         f"num_lvls={model_args.sat_cfg.get('num_lvls')}"
     )
     model, _ = build_sat_model(model_args, set_criterion=False)
-    
 
     print(f"重みを読み込み中: {args.weights}")
     state_dict = torch.load(args.weights, map_location='cpu', weights_only=False)
@@ -966,34 +900,13 @@ def main():
                     # --- Calibration ---
                     n_calib = max(1, args.static_int8_calibration_frames)
                     print(f"[INFO] static_int8_fused_mlp: calibrating with {n_calib} frame(s)")
-                    _calib_cap = cv2.VideoCapture(args.input)
-                    calib_frames = []
-                    for _ in range(n_calib):
-                        ok, frm = _calib_cap.read()
-                        if not ok:
-                            break
-                        calib_frames.append(frm)
-                    _calib_cap.release()
+                    calib_frames = read_calibration_frames(args.input, n_calib)
                     if not calib_frames:
                         print("[WARN] no calibration frames available, skipping")
                     else:
-                        # model.eval() is called later; force eval mode for calibration to skip training-only paths (DN, prepare_for_cdn)
-                        prev_training = model.training
-                        model.eval()
-                        with torch.no_grad(), CalibrationHooks(hot_targets) as hooks:
-                            for frm in calib_frames:
-                                img_tensor, img_size, orig_size = preprocess_frame(frm, args.input_size, use_sat=True)
-                                img_tensor = img_tensor.to(device)
-                                if use_bf16:
-                                    img_tensor = img_tensor.to(torch.bfloat16)
-                                tgts = [{
-                                    'img_size': torch.tensor(img_size).to(device),
-                                    'img_path': 'calibration',
-                                }]
-                                _ = model([img_tensor], tgts)
+                        with CalibrationHooks(hot_targets) as hooks:
+                            run_calibration_forward(model, calib_frames, args.input_size, device, use_bf16)
                             scales_dict = hooks.scales()
-                        if prev_training:
-                            model.train()
                         # --- Replacement ---
                         n_replaced = apply_static_int8_fused(model, scales_dict)
                         scale_preview = ", ".join(
@@ -1023,33 +936,13 @@ def main():
             if ffn_targets:
                 n_calib = max(1, args.static_int8_calibration_frames)
                 print(f"[INFO] static_scale_int8_decoder_ffn: calibrating with {n_calib} frame(s)")
-                _calib_cap = cv2.VideoCapture(args.input)
-                calib_frames = []
-                for _ in range(n_calib):
-                    ok, frm = _calib_cap.read()
-                    if not ok:
-                        break
-                    calib_frames.append(frm)
-                _calib_cap.release()
+                calib_frames = read_calibration_frames(args.input, n_calib)
                 if not calib_frames:
                     print("[WARN] no calibration frames available, skipping")
                 else:
-                    prev_training = model.training
-                    model.eval()
-                    with torch.no_grad(), LinearCalibrationHooks(ffn_targets) as hooks:
-                        for frm in calib_frames:
-                            img_tensor, img_size, orig_size = preprocess_frame(frm, args.input_size, use_sat=True)
-                            img_tensor = img_tensor.to(device)
-                            if use_bf16:
-                                img_tensor = img_tensor.to(torch.bfloat16)
-                            tgts = [{
-                                'img_size': torch.tensor(img_size).to(device),
-                                'img_path': 'calibration',
-                            }]
-                            _ = model([img_tensor], tgts)
+                    with LinearCalibrationHooks(ffn_targets) as hooks:
+                        run_calibration_forward(model, calib_frames, args.input_size, device, use_bf16)
                         ffn_scales = hooks.scales()
-                    if prev_training:
-                        model.train()
                     n_replaced = apply_static_scale_int8_decoder_ffn(model, ffn_scales)
                     sample = ", ".join(
                         f"{k.split('/')[-1]}={s:.4g}"
@@ -1260,15 +1153,7 @@ def main():
             'udp_enabled',
         ])
 
-    pred_frame_ids = []
-    pred_image_paths = []
-    pred_person_counts = []
-    pred_joints2d = []
-    pred_joints3d = []
-    pred_verts = []
-    pred_transl = []
-    pred_bboxes = []
-    pred_focal_length = []
+    pred_store = {key: [] for key in ('frame_ids', 'image_paths', 'person_counts') + PRED_RECORD_KEYS}
 
     sock = None
     ue_host = None
@@ -1321,15 +1206,7 @@ def main():
                 total_persons += num_persons
 
                 if args.pred_npz:
-                    pred_frame_ids.append(frame_idx)
-                    pred_image_paths.append(f"{args.input}#frame_{frame_idx:06d}")
-                    pred_person_counts.append(num_persons)
-                    pred_joints2d.append(pred_record['joints2d'])
-                    pred_joints3d.append(pred_record['joints3d'])
-                    pred_verts.append(pred_record['verts'])
-                    pred_transl.append(pred_record['transl'])
-                    pred_bboxes.append(pred_record['bboxes'])
-                    pred_focal_length.append(pred_record['focal_length'])
+                    append_pred_record(pred_store, frame_idx, args.input, num_persons, pred_record)
 
                 for k, v in times.items():
                     all_times[k].append(v)
@@ -1454,54 +1331,20 @@ def main():
 
                 elapsed = time.time() - start_time
                 if not first_frame_done:
-                    total_startup_time = time.perf_counter() - processing_start_time
-                    print(
-                        f"[INFO] First frame completed: frame={frame_idx} "
-                        f"total={total_startup_time:.4f}s "
-                        f"inference={times['inference'] * 1000.0:.1f}ms"
-                    )
+                    print_first_frame_done(frame_idx, processing_start_time, times)
                     first_frame_done = True
                 current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
-                fps_queue.append(current_fps)
-                if len(fps_queue) > 30:
-                    fps_queue.pop(0)
-                avg_fps_30 = float(np.mean(fps_queue)) if fps_queue else 0.0
+                avg_fps_30 = update_fps_window(fps_queue, current_fps)
                 if metrics_writer is not None:
-                    metrics_writer.writerow([
-                        frame_idx,
-                        num_persons,
-                        f'{times["preprocess"] * 1000.0:.4f}',
-                        f'{times["inference"] * 1000.0:.4f}',
-                        f'{times["postprocess"] * 1000.0:.4f}',
-                        f'{times["render"] * 1000.0:.4f}' if 'render' in times else '',
-                        f'{elapsed * 1000.0:.4f}',
-                        f'{current_fps:.6f}',
-                        f'{avg_fps_30:.6f}',
-                        int(args.udp),
-                    ])
+                    metrics_writer.writerow(metrics_csv_row(
+                        frame_idx, num_persons, times, elapsed, current_fps, avg_fps_30, int(args.udp)))
                     metrics_fp.flush()
 
                 if writer is not None:
                     writer.write(result_frame)
 
                 if args.show_fps and args.display:
-                    cv2.putText(result_frame, f"FPS: {current_fps:.1f}", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    cv2.putText(result_frame, f"Persons: {num_persons}", (10, 70),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    y_offset = 110
-                    cv2.putText(result_frame, f"Preprocess: {times['preprocess']*1000:.1f}ms", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                    y_offset += 30
-                    cv2.putText(result_frame, f"Inference: {times['inference']*1000:.1f}ms", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                    y_offset += 30
-                    cv2.putText(result_frame, f"Postprocess: {times['postprocess']*1000:.1f}ms", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                    if 'render' in times:
-                        y_offset += 30
-                        cv2.putText(result_frame, f"Render: {times['render']*1000:.1f}ms", (10, y_offset),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    draw_timing_overlay(result_frame, current_fps, num_persons, times)
 
                 if args.display:
                     cv2.imshow('SAT-HMR Video Demo', result_frame)
@@ -1510,14 +1353,7 @@ def main():
                         print("\n中断されました")
                         break
                 elif frame_idx % 30 == 0:
-                    render_ms = f"{times['render']*1000:.0f}ms" if 'render' in times else 'skip'
-                    print(
-                        f"Frame: {frame_idx}/{total_frames} | FPS: {current_fps:.1f} | Persons: {num_persons} | "
-                        f"Preprocess: {times['preprocess']*1000:.0f}ms | "
-                        f"Inference: {times['inference']*1000:.0f}ms | "
-                        f"Postprocess: {times['postprocess']*1000:.0f}ms | "
-                        f"Render: {render_ms}"
-                    )
+                    print_frame_status(frame_idx, total_frames, current_fps, num_persons, times)
 
                 frame_idx += 1
                 pbar.update(1)
@@ -1549,15 +1385,7 @@ def main():
                     total_persons += num_persons
 
                     if args.pred_npz:
-                        pred_frame_ids.append(frame_idx)
-                        pred_image_paths.append(f"{args.input}#frame_{frame_idx:06d}")
-                        pred_person_counts.append(num_persons)
-                        pred_joints2d.append(pred_record['joints2d'])
-                        pred_joints3d.append(pred_record['joints3d'])
-                        pred_verts.append(pred_record['verts'])
-                        pred_transl.append(pred_record['transl'])
-                        pred_bboxes.append(pred_record['bboxes'])
-                        pred_focal_length.append(pred_record['focal_length'])
+                        append_pred_record(pred_store, frame_idx, args.input, num_persons, pred_record)
 
                     for k, v in times.items():
                         all_times[k].append(v)
@@ -1569,55 +1397,22 @@ def main():
                         + times.get('render', 0.0)
                     )
                     if not first_frame_done:
-                        total_startup_time = time.perf_counter() - processing_start_time
-                        print(
-                            f"[INFO] First frame completed: frame={frame_idx} "
-                            f"total={total_startup_time:.4f}s "
-                            f"inference={times['inference'] * 1000.0:.1f}ms"
-                        )
+                        print_first_frame_done(frame_idx, processing_start_time, times)
                         first_frame_done = True
                     current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
-                    fps_queue.append(current_fps)
-                    if len(fps_queue) > 30:
-                        fps_queue.pop(0)
-                    avg_fps_30 = float(np.mean(fps_queue)) if fps_queue else 0.0
+                    avg_fps_30 = update_fps_window(fps_queue, current_fps)
 
                     if metrics_writer is not None:
-                        metrics_writer.writerow([
-                            frame_idx,
-                            num_persons,
-                            f'{times["preprocess"] * 1000.0:.4f}',
-                            f'{times["inference"] * 1000.0:.4f}',
-                            f'{times["postprocess"] * 1000.0:.4f}',
-                            f'{times["render"] * 1000.0:.4f}' if 'render' in times else '',
-                            f'{elapsed * 1000.0:.4f}',
-                            f'{current_fps:.6f}',
-                            f'{avg_fps_30:.6f}',
-                            0,
-                        ])
+                        # Batched inference never sends UDP (it is disabled for batch_size > 1).
+                        metrics_writer.writerow(metrics_csv_row(
+                            frame_idx, num_persons, times, elapsed, current_fps, avg_fps_30, 0))
                         metrics_fp.flush()
 
                     if writer is not None:
                         writer.write(result_frame)
 
                     if args.show_fps and args.display:
-                        cv2.putText(result_frame, f"FPS: {current_fps:.1f}", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        cv2.putText(result_frame, f"Persons: {num_persons}", (10, 70),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        y_offset = 110
-                        cv2.putText(result_frame, f"Preprocess: {times['preprocess']*1000:.1f}ms", (10, y_offset),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                        y_offset += 30
-                        cv2.putText(result_frame, f"Inference: {times['inference']*1000:.1f}ms", (10, y_offset),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                        y_offset += 30
-                        cv2.putText(result_frame, f"Postprocess: {times['postprocess']*1000:.1f}ms", (10, y_offset),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                        if 'render' in times:
-                            y_offset += 30
-                            cv2.putText(result_frame, f"Render: {times['render']*1000:.1f}ms", (10, y_offset),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        draw_timing_overlay(result_frame, current_fps, num_persons, times)
 
                     if args.display:
                         cv2.imshow('SAT-HMR Video Demo', result_frame)
@@ -1627,14 +1422,7 @@ def main():
                             stop_requested = True
                             break
                     elif frame_idx % 30 == 0:
-                        render_ms = f"{times['render']*1000:.0f}ms" if 'render' in times else 'skip'
-                        print(
-                            f"Frame: {frame_idx}/{total_frames} | FPS: {current_fps:.1f} | Persons: {num_persons} | "
-                            f"Preprocess: {times['preprocess']*1000:.0f}ms | "
-                            f"Inference: {times['inference']*1000:.0f}ms | "
-                            f"Postprocess: {times['postprocess']*1000:.0f}ms | "
-                            f"Render: {render_ms}"
-                        )
+                        print_frame_status(frame_idx, total_frames, current_fps, num_persons, times)
 
                     frame_idx += 1
                     pbar.update(1)
@@ -1660,15 +1448,15 @@ def main():
             os.makedirs(pred_dir, exist_ok=True)
         np.savez_compressed(
             args.pred_npz,
-            frame_ids=np.asarray(pred_frame_ids, dtype=np.int64),
-            image_paths=np.asarray(pred_image_paths, dtype=object),
-            person_counts=np.asarray(pred_person_counts, dtype=np.int32),
-            joints2d=np.asarray(pred_joints2d, dtype=object),
-            joints3d=np.asarray(pred_joints3d, dtype=object),
-            verts=np.asarray(pred_verts, dtype=object),
-            transl=np.asarray(pred_transl, dtype=object),
-            bboxes=np.asarray(pred_bboxes, dtype=object),
-            focal_length=np.asarray(pred_focal_length, dtype=object),
+            frame_ids=np.asarray(pred_store['frame_ids'], dtype=np.int64),
+            image_paths=np.asarray(pred_store['image_paths'], dtype=object),
+            person_counts=np.asarray(pred_store['person_counts'], dtype=np.int32),
+            joints2d=np.asarray(pred_store['joints2d'], dtype=object),
+            joints3d=np.asarray(pred_store['joints3d'], dtype=object),
+            verts=np.asarray(pred_store['verts'], dtype=object),
+            transl=np.asarray(pred_store['transl'], dtype=object),
+            bboxes=np.asarray(pred_store['bboxes'], dtype=object),
+            focal_length=np.asarray(pred_store['focal_length'], dtype=object),
             failed_frames=np.int32(0),
         )
 

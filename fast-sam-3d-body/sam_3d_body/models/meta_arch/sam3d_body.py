@@ -4,13 +4,6 @@ import time
 from typing import Any, Dict, Optional, Tuple
 import os
 import numpy as np
-
-_QUIET = os.environ.get("SAM3D_QUIET", "0") == "1"
-
-
-def _print(*args, **kwargs):
-    if not _QUIET:
-        print(*args, **kwargs)
 import roma
 import torch
 import torch.nn as nn
@@ -26,6 +19,7 @@ from sam_3d_body.models.modules.mhr_utils import (
 )
 from sam_3d_body.utils import recursive_to
 from sam_3d_body.utils.logging import get_pylogger
+from sam_3d_body.utils.quiet import quiet_print as _print
 
 from ..backbones import create_backbone
 from ..decoders import build_decoder, build_keypoint_sampler, PromptEncoder

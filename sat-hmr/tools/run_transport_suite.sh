@@ -117,9 +117,11 @@ if [[ -n "${TCP_CSV}" ]]; then
 fi
 "${CMD[@]}"
 
-python tools/plot_transport_matrix.py \
-  --matrix_csv "${MATRIX_CSV}" \
-  --outdir "${RUN_DIR}"
+if [[ -f tools/plot_transport_matrix.py ]]; then
+  python tools/plot_transport_matrix.py \
+    --matrix_csv "${MATRIX_CSV}" \
+    --outdir "${RUN_DIR}"
+fi
 
 ln -sfn "${RUN_NAME}" "plots/transport_runs/latest"
 

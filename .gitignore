@@ -3,17 +3,19 @@ weights/
 datasets/
 datas/
 # checkpoints はDLした重み置き場 → 原則除外。ただしユーザー改変のconfig/docは残す
-checkpoints/**
-!checkpoints/**/
-!checkpoints/**/*.yaml
-!checkpoints/**/*.yml
-!checkpoints/**/*.json
-!checkpoints/**/*.md
-!checkpoints/**/LICENSE
+# （先頭に **/ を付けないとリポジトリ直下の checkpoints/ にしか効かない）
+**/checkpoints/**
+!**/checkpoints/**/
+!**/checkpoints/**/*.yaml
+!**/checkpoints/**/*.yml
+!**/checkpoints/**/*.json
+!**/checkpoints/**/*.md
+!**/checkpoints/**/LICENSE
 trained_models/
 model_data/
 data/
 smpl/
+/body_models/
 outputs/
 results/
 sam3d_body_annotations/
@@ -22,7 +24,8 @@ sam3d_body_annotations/
 venv*/
 .venv/
 env/
-__pycache__/
+# 末尾に / を付けないことでシンボリックリンクも対象にする
+**/__pycache__
 *.pyc
 *.pyo
 *.so
@@ -47,11 +50,11 @@ dist/
 *.h5
 *.mp4
 *.avi
+*.mkv
 *.mov
 *.bvh
 *.fbx
 *.obj
-*.csv
 # 注: *.gif / *.png / *.jpg は README・結果図として維持（除外しない）
 
 # === 計測 / プロファイル / ログ ===
@@ -59,8 +62,10 @@ dist/
 *.sqlite
 *.csv
 *.log
+*.out
 *.bak
 *.bak.*
+*.partial
 *_kern.txt
 
 # === 中間出力ディレクトリ ===
@@ -71,6 +76,8 @@ plots/
 videos/
 demo_results/
 output/
+# 末尾に / を付けないことでシンボリックリンクも対象にする
+**/.cache
 
 # === エディタ / OS / ツール ===
 .codex/
@@ -79,3 +86,67 @@ output/
 .vscode/
 *:Zone.Identifier
 .DS_Store
+
+# Local runtime data and development artifacts (keep files on disk)
+/.local-history/
+/.codex_runs/
+/log/
+/result_images/
+/result_image_train/
+**/active_configs/
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+**/.vs/
+**/Deliverables/
+**/Recordings/
+**/Build/Windows/FileOpenOrder/
+*.sln
+*.suo
+*.user
+*.pdb
+*.dll
+*.exe
+
+# サブプロジェクト内の重み・データ置き場（シンボリックリンクも含めて丸ごと除外）
+/checkpoints/
+/sat-hmr/weights
+/sat-hmr/videos
+/romp/checkpoints
+/romp/model_data
+/romp/smpl
+/romp/trained_models
+/fast-sam-3d-body/videos
+/fast-sam-3d-body/mhr2smpl/data
+/fast-sam-3d-body/checkpoints/bf16
+/fast-sam-3d-body/checkpoints/moge_trt
+/fast-sam-3d-body/checkpoints/yolo
+/fast-sam-3d-body/checkpoints/sam-3d-body-dinov3/assets
+/fast-sam-3d-body/checkpoints/sam-3d-body-dinov3/backbone_trt
+# 外部ライブラリの clone（独自 .git を持つため親リポジトリに含めない）
+/sat-hmr/chumpy/
+# 旧UE録画スクリプト（ue/ に置き換え済み。ローカルの固定パスを含む）
+/sat-hmr/scripts/
+# plot_*.py が生成するグラフ画像は Git に含めない（スクリプトから再生成可能）
+/results_png/
+
+# Generated paper exports and slides remain local
+*.pdf
+*.pptx
+# 論文原稿・LaTeX ソース・参考文献は Git に含めない
+/papers/
+/paper_draft*.md
+/references.bib
+# 独自追加の資料（README以外のmd）は Git に含めない（上流由来の md は残す）
+/romp/docs/romp_video_input_vs_sathmr_seed_spec.md
+/sat-hmr/onnx-tensorRT_explain.md
+/sat-hmr/docs/*.md
+!/sat-hmr/docs/fix_chumpy.md
+!/sat-hmr/docs/data_preparation.md
+# プロット用スクリプトは measurements/ 以外では Git に含めない
+/sat-hmr/tools/plot_*.py
+/sat-hmr/tools/run_plots.sh
+
+# UE project (without SMPL) is distributed as a GitHub Release zip (ue-unreal-project.zip), not tracked in Git
+/ue/unreal/

@@ -22,26 +22,18 @@ class PoseInterpolator:
         body_quat: np.ndarray,  # WXYZ format
         smpl_joints: np.ndarray,
         smpl_pose: np.ndarray,
-        root_trans: np.ndarray = None,
     ):
-        """Add a pose to the interpolator. body_quat must be in WXYZ format.
-
-        Args:
-            root_trans: optional (3,) root translation in camera space (metres).
-                        Used for UE UDP/TCP streaming. Pass ``out["pred_cam_t"]``.
-        """
+        """Add a pose to the interpolator. body_quat must be in WXYZ format."""
         with self._lock:
             self.last_pose = self.current_pose
             self.last_t = self.current_t
-            self.current_pose = (body_quat, smpl_joints, smpl_pose, root_trans)
+            self.current_pose = (body_quat, smpl_joints, smpl_pose)
             self.current_t = timestamp
 
     def get_latest_pose(self):
         """Returns the most recently added pose (body_quat in WXYZ)."""
         with self._lock:
-            if self.current_pose is None:
-                return None
-            return self.current_pose[:3]
+            return self.current_pose
 
     def interpolate(self, query_t):
         with self._lock:
@@ -54,8 +46,8 @@ class PoseInterpolator:
 
             alpha = np.clip((query_t - self.last_t) / dt, 0.0, 1.0)
 
-            last_quat, last_joints, last_pose, last_trans = self.last_pose
-            curr_quat, curr_joints, curr_pose, curr_trans = self.current_pose
+            last_quat, last_joints, last_pose = self.last_pose
+            curr_quat, curr_joints, curr_pose = self.current_pose
 
         # Slerp quaternion
         # Scipy uses XYZW, so we convert WXYZ -> XYZW for the calculation
@@ -82,12 +74,4 @@ class PoseInterpolator:
             slerp_i = Slerp([0, 1], Rotation.concatenate([r_last, r_curr]))
             smpl_pose[i] = slerp_i([alpha])[0].as_rotvec()
 
-        # Lerp root translation (optional)
-        root_trans = None
-        if last_trans is not None and curr_trans is not None:
-            root_trans = (
-                np.asarray(last_trans, dtype=np.float64) * (1 - alpha)
-                + np.asarray(curr_trans, dtype=np.float64) * alpha
-            )
-
-        return body_quat, smpl_joints, smpl_pose, root_trans
+        return body_quat, smpl_joints, smpl_pose

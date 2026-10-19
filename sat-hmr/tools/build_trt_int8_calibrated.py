@@ -6,14 +6,15 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
-import cv2
 import numpy as np
 
-
-MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
-STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+from calib_image_utils import (
+    preprocess_calibration_image,
+    resolve_manifest_path,
+    unique_paths,
+)
 
 
 def cuda_call(ret, name: str):
@@ -51,59 +52,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def process_img_like_base(img: np.ndarray, input_size: int) -> Tuple[np.ndarray, Tuple[int, int]]:
-    ori_h, ori_w = img.shape[:2]
-    if ori_w >= ori_h:
-        resize_rate = input_size / float(ori_w)
-        new_w = input_size
-        new_h = int(resize_rate * ori_h)
-    else:
-        resize_rate = input_size / float(ori_h)
-        new_h = input_size
-        new_w = int(resize_rate * ori_w)
-    img_resized = cv2.resize(img, (new_w, new_h))
-    return img_resized, (new_h, new_w)
-
-
-def preprocess_image(
-    image_path: Path,
-    input_size: int,
-    patch_size: int,
-    expected_hw: Tuple[int, int],
-) -> np.ndarray:
-    img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-    if img is None:
-        raise RuntimeError(f"Failed to read image: {image_path}")
-
-    img_resized, img_size = process_img_like_base(img, input_size)
-    pad_h = ((img_size[0] + patch_size - 1) // patch_size) * patch_size
-    pad_w = ((img_size[1] + patch_size - 1) // patch_size) * patch_size
-
-    pad_img = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-    pad_img[: img_size[0], : img_size[1]] = img_resized
-
-    if (pad_h, pad_w) != expected_hw:
-        raise RuntimeError(
-            f"Preprocess shape mismatch for {image_path}: got {(pad_h, pad_w)} expected {expected_hw}"
-        )
-
-    rgb = pad_img[:, :, ::-1].astype(np.float32) / 255.0
-    rgb = (rgb - MEAN) / STD
-    chw = np.transpose(rgb, (2, 0, 1)).astype(np.float32)
-    return np.ascontiguousarray(chw)
-
-
-def _resolve_manifest_path(raw_path: str, manifest_path: Path) -> Path:
-    p = Path(raw_path)
-    if p.is_absolute() and p.exists():
-        return p
-    cands = [manifest_path.parent / raw_path, Path(raw_path)]
-    for c in cands:
-        if c.exists():
-            return c
-    return cands[0]
-
-
 def load_manifest_images(manifest_path: Path) -> List[Path]:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
@@ -121,7 +69,7 @@ def load_manifest_images(manifest_path: Path) -> List[Path]:
                 image_path = vals[1].strip() if len(vals) >= 2 and vals[1] else ""
             if not image_path:
                 continue
-            resolved = _resolve_manifest_path(image_path, manifest_path)
+            resolved = resolve_manifest_path(image_path, manifest_path)
             if resolved.is_file():
                 images.append(resolved)
 
@@ -140,18 +88,6 @@ def load_dir_images(calib_dir: Path) -> List[Path]:
     if not images:
         raise RuntimeError(f"No images found in directory: {calib_dir}")
     return images
-
-
-def unique_paths(paths: Iterable[Path]) -> List[Path]:
-    out: List[Path] = []
-    seen = set()
-    for p in paths:
-        key = str(p.resolve())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
 
 
 def collect_calibration_images(args: argparse.Namespace) -> List[Path]:
@@ -249,7 +185,7 @@ def build_engine(args: argparse.Namespace) -> int:
 
     # Validate one sample early to catch preprocessing mismatch.
     try:
-        _ = preprocess_image(images[0], args.input_size, args.patch_size, expected_hw)
+        _ = preprocess_calibration_image(images[0], args.input_size, args.patch_size, expected_hw)
     except Exception as exc:
         print(f"[ERROR] Calibration preprocessing check failed: {exc}")
         return 2
@@ -288,7 +224,7 @@ def build_engine(args: argparse.Namespace) -> int:
 
             batch = np.empty((self.batch_size, c, self.expected_hw[0], self.expected_hw[1]), dtype=np.float32)
             for i, p in enumerate(batch_paths):
-                batch[i] = preprocess_image(
+                batch[i] = preprocess_calibration_image(
                     p,
                     input_size=self.input_size,
                     patch_size=self.patch_size,

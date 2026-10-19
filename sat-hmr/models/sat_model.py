@@ -28,8 +28,6 @@ from .decoder import build_decoder
 from .position_encoding import position_encoding_xy
 from .criterion import SetCriterion
 from .dn_components import prepare_for_cdn, dn_post_process
-from .grouped_bbox_embed import GroupedBBoxEmbedReference, GroupedBBoxEmbedFusedInt8
-from .triton_grouped_int8 import GroupedInt8LinearTriton
 import copy
 
 from configs.paths import smpl_model_path
@@ -205,11 +203,6 @@ class Model(nn.Module):
             self.bbox_embed = nn.ModuleList([MLP(hidden_dim, hidden_dim, 4, 3) for i in range(num_dec_layers)])
         else:
             self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.use_grouped_bbox_embed = False
-        self.grouped_bbox_embed_impl = "bmm"
-        self.grouped_bbox_embed_ref = None
-        self.use_fused_int8_bbox_embed_hidden = False
-        self.fused_int8_bbox_embed_hidden_ref = None
         # poses (use 6D rotation)
         self.pose_head = MLP(hidden_dim, hidden_dim, num_poses*6, 6)
         # shape
@@ -254,7 +247,6 @@ class Model(nn.Module):
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
-        self.rebuild_grouped_bbox_embed()
         # ========== End of decoder settings =============
 
 
@@ -274,38 +266,8 @@ class Model(nn.Module):
     def lvl_pooling(self, tokens):
         return _lvl_pool4(tokens)
 
-    def rebuild_grouped_bbox_embed(self):
-        if isinstance(self.bbox_embed, nn.ModuleList):
-            self.grouped_bbox_embed_ref = GroupedBBoxEmbedReference.from_bbox_embed(
-                self.bbox_embed,
-                impl=self.grouped_bbox_embed_impl,
-            )
-            if GroupedInt8LinearTriton.is_supported():
-                self.fused_int8_bbox_embed_hidden_ref = GroupedBBoxEmbedFusedInt8.from_bbox_embed(
-                    self.bbox_embed
-                )
-            else:
-                self.fused_int8_bbox_embed_hidden_ref = None
-        else:
-            self.grouped_bbox_embed_ref = None
-            self.fused_int8_bbox_embed_hidden_ref = None
-
     def forward_bbox_embed(self, hs):
-        if (
-            self.use_fused_int8_bbox_embed_hidden
-            and self.fused_int8_bbox_embed_hidden_ref is not None
-            and hs.ndim >= 4
-            and hs.shape[0] == len(self.bbox_embed)
-        ):
-            return self.fused_int8_bbox_embed_hidden_ref(hs)
-        if (
-            self.use_grouped_bbox_embed
-            and self.grouped_bbox_embed_ref is not None
-            and hs.ndim >= 4
-            and hs.shape[0] == len(self.bbox_embed)
-        ):
-            grouped_ref = self.grouped_bbox_embed_ref.to(device=hs.device, dtype=hs.dtype)
-            return grouped_ref(hs)
+        # hs: (num_decoder_layers, bs, num_queries, dim); one bbox MLP per decoder layer.
         return torch.stack([self.bbox_embed[lvl](hs[lvl]) for lvl in range(hs.shape[0])], dim=0)
                 
     def get_scale_map(self, x_list):

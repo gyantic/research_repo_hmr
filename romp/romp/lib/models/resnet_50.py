@@ -143,49 +143,9 @@ class ResNet_50(nn.Module):
                         nn.init.constant_(m.bias, 0)
 
 
-"""
 if __name__ == '__main__':
     args().pretrain = 'spin'
     model = ResNet_50().cuda()
     a=model(torch.rand(2,512,512,3).cuda())
     for i in a:
         print(i.shape)
-"""
-if __name__ == '__main__':
-    import time
-    from config import args as _args
-
-    torch.backends.cudnn.benchmark = True
-
-    H, W = 512, 512
-    batch = 8
-    n_iter = 50
-
-    cfg = _args()
-
-    for mode in ['fp32', 'fp16']:
-        print('===', mode, '===')
-
-        cfg.model_precision = mode  # feed_forward / image_preprocess 内の分岐と同期
-
-        model = ResNet_50().cuda().eval()
-
-        if mode == 'fp32':
-            x = torch.rand(batch, H, W, 3, device='cuda', dtype=torch.float32)
-        else:
-            model.half()
-            x = torch.rand(batch, H, W, 3, device='cuda', dtype=torch.float16)
-
-        # warmup
-        with torch.no_grad():
-            for _ in range(10):
-                y = model(x)
-
-        torch.cuda.synchronize()
-        t0 = time.time()
-        with torch.no_grad():
-            for _ in range(n_iter):
-                y = model(x)
-        torch.cuda.synchronize()
-        dt = (time.time() - t0) / n_iter
-        print('time per iter [ms]:', dt * 1000)

@@ -26,6 +26,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from checkpoint_io import file_size_mb, load_checkpoint, strip_module_prefix
+
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -37,27 +39,8 @@ if not hasattr(np, "bool"):
 import romp  # noqa: F401  # Adds ROMP lib paths.
 
 
-def file_size_mb(path: pathlib.Path) -> float:
-    return path.stat().st_size / 1024 ** 2
-
-
-def load_checkpoint(path: pathlib.Path):
-    raw = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(raw, dict):
-        state_dict = raw.get("model_state_dict", raw)
-    else:
-        state_dict = raw
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Unsupported checkpoint payload type: {type(state_dict)!r}")
-    return raw, state_dict
-
-
-def normalize_state_dict(state_dict: dict) -> dict:
-    return {k.removeprefix("module."): v for k, v in state_dict.items()}
-
-
 def extract_backbone_state_dict(state_dict: dict) -> dict:
-    normalized = normalize_state_dict(state_dict)
+    normalized = strip_module_prefix(state_dict)
     backbone_state_dict = {
         key.removeprefix("backbone."): value
         for key, value in normalized.items()
@@ -104,12 +87,13 @@ def build_output_payload(raw_checkpoint, merged_state_dict: dict, source_checkpo
     }
 
 
+def is_int8_quant_target(module: nn.Module) -> bool:
+    # Same layer selection as romp/base.py::_is_torchao_int8_weight_only_target.
+    return isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, "weight")
+
+
 def quant_target_modules(modules: Iterable[tuple[str, nn.Module]]) -> list[tuple[str, nn.Module]]:
-    return [
-        (name, module)
-        for name, module in modules
-        if isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, "weight")
-    ]
+    return [(name, module) for name, module in modules if is_int8_quant_target(module)]
 
 
 def parse_cli() -> argparse.Namespace:
@@ -182,7 +166,7 @@ def main() -> None:
     quantize_(
         model,
         IntxWeightOnlyConfig(weight_dtype=torch.int8),
-        filter_fn=lambda module, _fqn: isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, "weight"),
+        filter_fn=lambda module, _fqn: is_int8_quant_target(module),
         device=device,
     )
 

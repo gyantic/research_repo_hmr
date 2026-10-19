@@ -59,7 +59,7 @@ class Attention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        if int8_attention_enabled(self) and not self.training:
+        if int8_attention_enabled() and not self.training:
             x = torchao_int8_attention(q, k, v, attn_bias=attn_bias, out_dtype=x.dtype).transpose(1, 2).reshape(B, N, C)
         else:
             attn = q @ k.transpose(-2, -1)
@@ -75,7 +75,7 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if int8_attention_enabled(self):
+        if int8_attention_enabled():
             dense_bias = attn_bias
             if attn_bias is not None and hasattr(attn_bias, "materialize"):
                 B, N, _ = x.shape

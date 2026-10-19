@@ -21,7 +21,7 @@ def PW3D(base_class=default_mode):
             super(PW3D, self).__init__(train_flag, regress_smpl=regress_smpl)
             self.data_folder = os.path.join(self.data_folder,'3DPW/')
             if not os.path.isdir(self.data_folder):
-                self.data_folder = '/home/kyuta/ROMP/data/3DPW'
+                self.data_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', '..', 'datasets', '3dpw')
             self.data3d_dir = os.path.join(self.data_folder,'sequenceFiles')
             image_dir = os.path.join(self.data_folder, 'imageFiles')
             self.image_dir = image_dir if os.path.isdir(image_dir) else self.data_folder
@@ -121,7 +121,7 @@ def PW3D(base_class=default_mode):
 
         def get_image_info(self, index):
             annots = self.annots[self.file_paths[index%len(self.file_paths)]]
-            sam3d_pose, sam3d_shape = None, None
+            # SAM3D teacher pose for distillation; zeros + valid=0 when no label exists.
             sam3d_pose = np.zeros((72,), dtype=np.float32)
             sam3d_valid = 0.0
             subject_ids, genders, kp2ds, kp3ds, params, bbox, valid_mask_2d, valid_mask_3d = [[] for i in range(8)]
@@ -178,15 +178,12 @@ def PW3D(base_class=default_mode):
                     if teacher is None:
                         key2 = f"imageFiles/{video_name}/image_{frame_id:05d}.jpg"
                         teacher = self.sam3d_labels.get(key2, None)
-                    else:
-                        key2 = None
                     if teacher is not None:
                         sam3d_pose = np.asarray(teacher['pose'], dtype=np.float32)  # (72,)
                         sam3d_valid = 1.0
                 except Exception as e:
                     logging.info(f"SAM3D key error: {e}")
                     # ラベルが無くても学習は続ける
-                    pass
 
             img_info = {'imgpath': imgpath, 
                         'image': image, 

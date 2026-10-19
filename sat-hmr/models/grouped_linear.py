@@ -1,3 +1,7 @@
+"""Grouped Linear reference/Triton kernels used only by tools/benchmark_grouped_bbox_int8.py.
+
+Not wired into the SAT-HMR model (the grouped decoder/bbox paths that used them were removed).
+"""
 from __future__ import annotations
 
 from typing import Sequence

@@ -201,6 +201,67 @@ def adjust_cam_int_for_crop(cam_int, transform_info):
     return new_cam_int
 
 
+def _find_next_ann_idx_after(annotations, sample_path, fallback_idx):
+    """Index of the annotation following the one saved in ``sample_path``.
+
+    Falls back to ``fallback_idx`` when the sample cannot be read or matched.
+    """
+    try:
+        last_data = np.load(sample_path, allow_pickle=True)
+        last_key = (
+            str(last_data["sequence"]),
+            int(last_data["frame_idx"]),
+            int(last_data["person_idx"]),
+        )
+        for idx, ann in enumerate(annotations):
+            ann_key = (ann["sequence"], int(ann["frame_idx"]), int(ann["person_idx"]))
+            if ann_key == last_key:
+                return idx + 1
+    except Exception:
+        pass
+    return fallback_idx
+
+
+def resolve_resume_position(annotations, samples_dir, resume_state_json):
+    """Return (start_ann_idx, sample_idx) for --resume.
+
+    Two sources are considered and the one that is further along wins:
+      1. ``processed_count`` in resume_state_json (survives deleted samples).
+      2. The last sample_*.npz in samples_dir.
+    """
+    start_ann_idx, sample_idx = 0, 0
+
+    if resume_state_json and Path(resume_state_json).exists():
+        try:
+            with open(resume_state_json, "r") as f:
+                resume_state = json.load(f)
+            processed_count = int(resume_state.get("processed_count", 0))
+            if processed_count > 0:
+                start_ann_idx = sample_idx = processed_count
+                print(
+                    f"[RESUME] Using state {resume_state_json}; "
+                    f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
+                )
+        except Exception as exc:
+            print(f"[RESUME] Could not read state {resume_state_json}: {exc}")
+
+    existing_samples = sorted(samples_dir.glob("sample_*.npz"))
+    if not existing_samples:
+        return start_ann_idx, sample_idx
+
+    last_sample = existing_samples[-1]
+    next_sample_idx = int(last_sample.stem.split("_")[-1]) + 1
+    next_ann_idx = _find_next_ann_idx_after(annotations, last_sample, next_sample_idx)
+    if next_ann_idx > start_ann_idx:
+        start_ann_idx = next_ann_idx
+        sample_idx = next_sample_idx
+    print(
+        f"[RESUME] Found {len(existing_samples)} samples; "
+        f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
+    )
+    return start_ann_idx, sample_idx
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, help="Path to 3DPW dataset root")
@@ -307,50 +368,11 @@ def main():
 
     print(f"Running single-person inference on {len(annotations)} samples...")
     print(f"Context factor: {args.context_factor}")
-    sample_idx = 0
-    start_ann_idx = 0
+    start_ann_idx, sample_idx = 0, 0
     if args.resume:
-        if args.resume_state_json and Path(args.resume_state_json).exists():
-            try:
-                with open(args.resume_state_json, "r") as f:
-                    resume_state = json.load(f)
-                processed_count = int(resume_state.get("processed_count", 0))
-                if processed_count > 0:
-                    start_ann_idx = processed_count
-                    sample_idx = processed_count
-                    print(
-                        f"[RESUME] Using state {args.resume_state_json}; "
-                        f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
-                    )
-            except Exception as exc:
-                print(f"[RESUME] Could not read state {args.resume_state_json}: {exc}")
-        existing_samples = sorted(samples_dir.glob("sample_*.npz"))
-        if existing_samples:
-            last_sample = existing_samples[-1]
-            existing_sample_idx = int(last_sample.stem.split("_")[-1]) + 1
-            try:
-                last_data = np.load(last_sample, allow_pickle=True)
-                last_key = (
-                    str(last_data["sequence"]),
-                    int(last_data["frame_idx"]),
-                    int(last_data["person_idx"]),
-                )
-                for idx, ann in enumerate(annotations):
-                    ann_key = (ann["sequence"], int(ann["frame_idx"]), int(ann["person_idx"]))
-                    if ann_key == last_key:
-                        existing_start_ann_idx = idx + 1
-                        break
-                else:
-                    existing_start_ann_idx = existing_sample_idx
-            except Exception:
-                existing_start_ann_idx = existing_sample_idx
-            if existing_start_ann_idx > start_ann_idx:
-                start_ann_idx = existing_start_ann_idx
-                sample_idx = existing_sample_idx
-            print(
-                f"[RESUME] Found {len(existing_samples)} samples; "
-                f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
-            )
+        start_ann_idx, sample_idx = resolve_resume_position(
+            annotations, samples_dir, args.resume_state_json
+        )
     inference_times = []
     timing_rows = []
 
@@ -410,7 +432,7 @@ def main():
                 "persons": len(preds) if preds else 0,
                 "detection_ms": timings.get("detection_ms", ""),
                 "fov_ms": timings.get("fov_ms", ""),
-                "inference_ms": timings.get("model_ms", ""),
+                "inference_ms": timings.get("model_ms", ""),  # model.run_inference only
                 "backbone_ms": timings.get("backbone_ms", ""),
                 "decoders_ms": timings.get("decoders_ms", ""),
                 "total_ms": inference_time,

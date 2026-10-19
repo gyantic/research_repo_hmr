@@ -1,3 +1,7 @@
+"""Grouped Linear reference/Triton kernels used only by tools/benchmark_grouped_bbox_int8.py.
+
+Not wired into the SAT-HMR model (the grouped decoder/bbox paths that used them were removed).
+"""
 from __future__ import annotations
 
 from typing import Sequence
@@ -96,107 +100,6 @@ if TRITON_AVAILABLE:
         bias_ptrs = bias_ptr + pid_g * stride_bg + offs_n * stride_bn
 
         x_scale = tl.load(x_scale_ptrs, mask=offs_m < M, other=1.0)
-        w_scale = tl.load(w_scale_ptrs, mask=offs_n < N, other=1.0)
-        bias = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)
-
-        out = acc.to(tl.float32) * x_scale[:, None] * w_scale[None, :] + bias[None, :]
-        out_ptrs = (
-            out_ptr
-            + pid_g * stride_og
-            + offs_m[:, None] * stride_om
-            + offs_n[None, :] * stride_on
-        )
-        tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=8, num_stages=2),
-        ],
-        key=["M", "N", "K"],
-    )
-    @triton.jit
-    def grouped_fp_input_int8_gemm_kernel(
-        x_ptr,
-        w_ptr,
-        out_ptr,
-        w_scale_ptr,
-        bias_ptr,
-        M,
-        N,
-        K,
-        stride_xg,
-        stride_xm,
-        stride_xk,
-        stride_wg,
-        stride_wk,
-        stride_wn,
-        stride_og,
-        stride_om,
-        stride_on,
-        stride_wsg,
-        stride_wsn,
-        stride_bg,
-        stride_bn,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-    ):
-        pid_m = tl.program_id(axis=0)
-        pid_n = tl.program_id(axis=1)
-        pid_g = tl.program_id(axis=2)
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
-
-        x_row_max = tl.zeros((BLOCK_M,), dtype=tl.float32)
-
-        for k_start in range(0, K, BLOCK_K):
-            k_offsets = k_start + offs_k
-            x_ptrs = (
-                x_ptr
-                + pid_g * stride_xg
-                + offs_m[:, None] * stride_xm
-                + k_offsets[None, :] * stride_xk
-            )
-            x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K), other=0.0)
-            tile_absmax = tl.max(tl.abs(x), axis=1)
-            x_row_max = tl.maximum(x_row_max, tile_absmax)
-
-        x_scale = tl.maximum(x_row_max / 127.0, 1e-5)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-
-        for k_start in range(0, K, BLOCK_K):
-            k_offsets = k_start + offs_k
-            x_ptrs = (
-                x_ptr
-                + pid_g * stride_xg
-                + offs_m[:, None] * stride_xm
-                + k_offsets[None, :] * stride_xk
-            )
-            w_ptrs = (
-                w_ptr
-                + pid_g * stride_wg
-                + k_offsets[:, None] * stride_wk
-                + offs_n[None, :] * stride_wn
-            )
-            x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (k_offsets[None, :] < K), other=0.0)
-            scaled_x = x / x_scale[:, None]
-            x_q = tl.where(
-                scaled_x >= 0,
-                tl.floor(scaled_x + 0.5),
-                tl.ceil(scaled_x - 0.5),
-            )
-            x_q = tl.clamp(x_q, -127.0, 127.0).to(tl.int8)
-            w = tl.load(w_ptrs, mask=(k_offsets[:, None] < K) & (offs_n[None, :] < N), other=0)
-            acc += tl.dot(x_q, w, out_dtype=tl.int32)
-
-        w_scale_ptrs = w_scale_ptr + pid_g * stride_wsg + offs_n * stride_wsn
-        bias_ptrs = bias_ptr + pid_g * stride_bg + offs_n * stride_bn
         w_scale = tl.load(w_scale_ptrs, mask=offs_n < N, other=1.0)
         bias = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)
 
@@ -554,10 +457,7 @@ class GroupedInt8LinearTriton(nn.Module):
                 f"Leading dim G must match grouped weight count: {x.shape[0]} vs {self.weight_q_t.shape[0]}"
             )
 
-        group_count = int(x.shape[0])
         batch_shape = tuple(int(v) for v in x.shape[1:-1])
-        in_dim = int(x.shape[-1])
-        flat_m = _prod(batch_shape)
         x_q, x_scale = self.quantize_activation(x)
         return self.forward_prequantized(x_q, x_scale, batch_shape=batch_shape)
 
@@ -624,66 +524,6 @@ class GroupedInt8LinearTriton(nn.Module):
             out.stride(2),
             x_scale.stride(0),
             x_scale.stride(1),
-            weight_scale.stride(0),
-            weight_scale.stride(1),
-            bias.stride(0),
-            bias.stride(1),
-        )
-        return out.to(dtype=out_dtype).reshape(group_count, *batch_shape, out_dim)
-
-    def forward_fused_input(
-        self,
-        x: torch.Tensor,
-        *,
-        batch_shape: tuple[int, ...] | None = None,
-        out_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        if not TRITON_AVAILABLE:
-            raise RuntimeError("Triton is not available in this environment")
-        if x.device.type != "cuda":
-            raise RuntimeError("GroupedInt8LinearTriton requires CUDA")
-        if x.ndim < 3:
-            raise ValueError(f"Expected x.ndim >= 3, got shape {tuple(x.shape)}")
-        if x.shape[0] != self.weight_q_t.shape[0]:
-            raise ValueError(
-                f"Leading dim G must match grouped weight count: {x.shape[0]} vs {self.weight_q_t.shape[0]}"
-            )
-
-        group_count = int(x.shape[0])
-        batch_shape = tuple(int(v) for v in x.shape[1:-1]) if batch_shape is None else batch_shape
-        in_dim = int(x.shape[-1])
-        flat_m = _prod(batch_shape)
-        out_dim = int(self.weight_q_t.shape[-1])
-
-        x_flat = x.reshape(group_count, flat_m, in_dim).to(torch.float32)
-        weight_q_t = self.weight_q_t.to(device=x.device)
-        weight_scale = self.weight_scale.to(device=x.device, dtype=torch.float32)
-        bias = self.bias.to(device=x.device, dtype=torch.float32)
-        out = torch.empty((group_count, flat_m, out_dim), device=x.device, dtype=torch.float32)
-
-        grid = lambda meta: (
-            triton.cdiv(flat_m, meta["BLOCK_M"]),
-            triton.cdiv(out_dim, meta["BLOCK_N"]),
-            group_count,
-        )
-        grouped_fp_input_int8_gemm_kernel[grid](
-            x_flat,
-            weight_q_t,
-            out,
-            weight_scale,
-            bias,
-            flat_m,
-            out_dim,
-            in_dim,
-            x_flat.stride(0),
-            x_flat.stride(1),
-            x_flat.stride(2),
-            weight_q_t.stride(0),
-            weight_q_t.stride(1),
-            weight_q_t.stride(2),
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
             weight_scale.stride(0),
             weight_scale.stride(1),
             bias.stride(0),

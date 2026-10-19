@@ -29,9 +29,7 @@ import argparse
 import pathlib
 import torch
 
-
-def file_size_mb(path: pathlib.Path) -> float:
-    return path.stat().st_size / 1024 ** 2
+from checkpoint_io import file_size_mb, load_checkpoint, strip_module_prefix
 
 
 def convert_state_dict_bf16(state_dict: dict) -> dict:
@@ -48,14 +46,8 @@ def convert_state_dict_bf16(state_dict: dict) -> dict:
 
 def load_state_dict(path: pathlib.Path) -> dict:
     """DataParallel prefix ('module.') を除去して state dict を返す。"""
-    raw = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(raw, dict):
-        sd = raw.get("model_state_dict", raw)
-    else:
-        sd = raw
-    # Strip 'module.' prefix if present (DataParallel checkpoint)
-    stripped = {k.removeprefix("module."): v for k, v in sd.items()}
-    return stripped
+    _raw, state_dict = load_checkpoint(path)
+    return strip_module_prefix(state_dict)
 
 
 def main() -> None:

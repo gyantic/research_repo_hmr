@@ -1,0 +1,31 @@
+name: hmr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - git
+  - setuptools=78.1.0
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+      - torchvision==0.20.1+cu121
+      - xformers==0.0.28.post3
+      - numpy==2.2.6
+      - scipy==1.16.3
+      - opencv-python==4.12.0.88
+      - smplx==0.1.28
+      - pyrender==0.1.45
+      - trimesh==4.10.1
+      - matplotlib==3.10.8
+      - accelerate==1.10.0
+      - tensorboard==2.20.0
+      - transformers==4.57.3
+      - joblib==1.5.3
+      - termcolor==3.2.0
+      - scikit-learn==1.8.0
+      - pyyaml==6.0.3
+      - tqdm==4.67.1
+      - moge @ git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8
+      - utils3d @ git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183
+      - pipeline @ git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6

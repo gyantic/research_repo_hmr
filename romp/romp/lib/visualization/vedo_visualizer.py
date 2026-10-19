@@ -48,8 +48,6 @@ class Vedo_visualizer(object):
         self.default_camera={'pos':{'far':(0,800,1000), 'close':(0,200,800)}[args().soi_camera]} 
         # Light([0,800,1000], c='white')
         self.lights = [Light([0,800,1000], intensity=0.6, c='white'), Light([0,-800,1000], intensity=0.6, c='white'), Light([0,800,-1000], intensity=0.6, c='white'), Light([0,-800,-1000], intensity=0.6, c='white')]
-        #vedo.settings.screeshotLargeImage = True
-        #vedo.settings.screeshotScale = 2
 
     def plot_multi_meshes_batch(self, vertices, cam_params, meta_data, reorganize_idx, save_img=True, interactive_show=False, rotate_frames=[]):
         result_save_names = []

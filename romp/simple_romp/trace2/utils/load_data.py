@@ -64,7 +64,6 @@ class InternetVideo(Dataset):
             self.sid_video_name[sid] = video_name
             self.sequence_ids.append([])
             for fid, frame_path in enumerate(self.sequence_dict[video_path]):
-                #self.file_paths.append([sid,fid,os.path.join(video_path, frame_path)])
                 self.file_paths.append([sid, fid, frame_path])
                 self.sequence_ids[sid].append(len(self.file_paths)-1)
         print('sid_video_name:',self.sid_video_name)

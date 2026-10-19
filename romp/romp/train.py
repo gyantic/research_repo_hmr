@@ -1,5 +1,3 @@
-import torch
-torch.autograd.set_detect_anomaly(False)
 from .base import *
 from .eval import val_result
 from loss_funcs import Loss, Learnable_Loss
@@ -43,8 +41,7 @@ class Trainer(Base):
         if not self.model_return_loss:
             outputs.update(self._calc_loss(outputs))
         loss, outputs = self.merge_losses(outputs, self.train_cfg['new_training'])
-        
-        #print("meta_data keys:", meta_data.keys())
+
         if self.global_count == 1:
             logging.info(f"[KD] sam3d_pose in meta_data: {'sam3d_pose' in meta_data}, "
                      f"is None: {meta_data.get('sam3d_pose') is None}")
@@ -63,17 +60,11 @@ class Trainer(Base):
             print("Skipping batch due to nan/inf loss")
             self.optimizer.zero_grad()
             return outputs, torch.zeros(1, device=loss.device)
-        if self.model_precision=='fp16':
-            # self.scaler.scale(loss).backward()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            # self.scaler.step(self.optimizer)
-            self.optimizer.step()
-            # self.scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+        # Same update for every precision: the fp16 GradScaler path was dropped in favour of
+        # plain backward + gradient clipping.
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        self.optimizer.step()
         return outputs, loss
 
     def train_log_visualization(self, outputs, loss, run_time, data_time, losses, losses_dict, epoch, iter_index):

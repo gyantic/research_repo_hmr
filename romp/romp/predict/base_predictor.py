@@ -44,19 +44,11 @@ class Predictor(Base):
         meta_data = img_preprocess(image, '0', input_size=args().input_size, single_img_input=True)
         if '-1' not in self.gpu:
             meta_data['image'] = meta_data['image'].cuda()
-        """
-        if args().model_precision == 'fp16':
-            meta_data['image']= meta_data['image'].to(torch.float16)
-        else:
-            meta_data['image'] = meta_data['image'].to(torch.float32)
-        """
-        #print("[DEBUG] img dtype:", meta_data['image'].dtype)
         outputs = self.net_forward(meta_data, cfg=self.demo_cfg)
         return outputs
 
     def reorganize_results(self, outputs, img_paths, reorganize_idx):
         results = {}
-        #print("ROMP outputs keys:", outputs.keys())
         cam_results = outputs['params']['cam'].detach().cpu().numpy().astype(np.float16)
         trans_results = outputs['cam_trans'].detach().cpu().numpy().astype(np.float16)
         smpl_pose_results = outputs['params']['poses'].detach().cpu().numpy().astype(np.float16)

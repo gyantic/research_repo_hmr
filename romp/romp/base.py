@@ -26,7 +26,10 @@ from visualization.visualization import Visualizer
 if args().model_precision=='fp16':
     from torch.cuda.amp import autocast, GradScaler
 
+TORCHAO_INT8_BACKBONE_QUANTIZATION = 'torchao_intx_weight_only_int8'  # meta tag written by tools/export_torchao_int8_backbone_romp.py
+
 def _is_torchao_int8_weight_only_target(module, fqn, scope='full'):
+    """Select Conv2d/Linear layers for int8 weight-only quantization; scope 'backbone' limits it to model.backbone."""
     if not (isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, 'weight')):
         return False
     if scope == 'full':
@@ -49,21 +52,22 @@ class Base(object):
         model = build_model()
         if self.fine_tune or self.eval:
             drop_prefix = ''
-            # Peek at checkpoint meta to detect pre-quantized backbone
-            _pre_quantize_backbone_int8 = False
+            # A checkpoint exported with an int8-quantized backbone stores torchao tensors,
+            # so the backbone must be quantized the same way *before* load_model copies them in.
+            pre_quantized_backbone_int8 = False
             if os.path.exists(self.model_path):
-                _ckpt = torch.load(self.model_path, map_location='cpu', weights_only=False)
-                _meta = _ckpt.get('meta', {}) if isinstance(_ckpt, dict) else {}
-                if (_meta.get('quantization') == 'torchao_intx_weight_only_int8'
-                        and _meta.get('scope') == 'backbone'):
-                    _pre_quantize_backbone_int8 = True
+                ckpt = torch.load(self.model_path, map_location='cpu', weights_only=False)
+                ckpt_meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
+                if (ckpt_meta.get('quantization') == TORCHAO_INT8_BACKBONE_QUANTIZATION
+                        and ckpt_meta.get('scope') == 'backbone'):
+                    pre_quantized_backbone_int8 = True
                     logging.info('[int8] Detected pre-quantized backbone checkpoint; pre-applying quantize_() before load.')
-            if _pre_quantize_backbone_int8:
+            if pre_quantized_backbone_int8:
                 model = model.cuda()
                 from torchao.quantization import quantize_, IntxWeightOnlyConfig
                 quantize_(model.backbone,
                           IntxWeightOnlyConfig(weight_dtype=torch.int8),
-                          filter_fn=lambda m, _: isinstance(m, (nn.Conv2d, nn.Linear)) and hasattr(m, 'weight'))
+                          filter_fn=lambda mod, fqn: _is_torchao_int8_weight_only_target(mod, fqn, scope='full'))
             if self.model_version==6:
                 model = load_model(self.model_path, model, prefix = 'module.', drop_prefix=drop_prefix, fix_loaded=True)
             else:
@@ -74,8 +78,6 @@ class Base(object):
             model = model.to(torch.bfloat16)
             logging.info('[bf16] model converted to bfloat16.')
         if getattr(self, 'torchao_int8_weight_only', False):
-            if self.model_precision == 'train':
-                raise NotImplementedError('torchao_int8_weight_only is only for inference.')
             model = model.cuda()  # torchao quantize_ requires CUDA
             try:
                 from torchao.quantization import quantize_, IntxWeightOnlyConfig
@@ -170,13 +172,8 @@ class Base(object):
     def network_forward(self, model, meta_data, cfg_dict):
         ds_org, imgpath_org = get_remove_keys(meta_data,keys=['data_set','imgpath'])
         meta_data['batch_ids'] = torch.arange(len(meta_data['image']))
-        if self.model_precision=='fp16':
-            # with autocast():
-            pass
-        if True:
-                outputs = model(meta_data, **cfg_dict)
-        else:
-            outputs = model(meta_data, **self.train_cfg)
+        # No autocast here even for fp16: the model itself is cast to the target dtype.
+        outputs = model(meta_data, **cfg_dict)
         meta_data.update({'imgpath':imgpath_org, 'data_set':ds_org})
         outputs['meta_data']['data_set'], outputs['meta_data']['imgpath'] = reorganize_items([ds_org, imgpath_org], outputs['reorganize_idx'].cpu().numpy())
         return outputs

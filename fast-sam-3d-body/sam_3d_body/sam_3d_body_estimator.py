@@ -1,5 +1,4 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-import os
 import time
 from typing import Optional, Union
 
@@ -7,13 +6,6 @@ import cv2
 
 import numpy as np
 import torch
-
-_QUIET = os.environ.get("SAM3D_QUIET", "0") == "1"
-
-
-def _print(*args, **kwargs):
-    if not _QUIET:
-        print(*args, **kwargs)
 
 from sam_3d_body.data.transforms import (
     Compose,
@@ -25,6 +17,7 @@ from sam_3d_body.data.transforms import (
 from sam_3d_body.data.utils.io import load_image
 from sam_3d_body.data.utils.prepare_batch import prepare_batch
 from sam_3d_body.utils import recursive_to
+from sam_3d_body.utils.quiet import quiet_print as _print
 from torchvision.transforms import ToTensor
 
 
@@ -293,9 +286,9 @@ class SAM3DBodyEstimator:
         else:
             boxes = np.array([0, 0, width, height]).reshape(1, 4)
             self.is_crop = False
-        _t_detection = time.perf_counter() - t0
-        _print(f"        [process_one_image] human_detection: {_t_detection:.4f}s")
-        self.last_timings["detection_ms"] = _t_detection * 1000
+        detection_elapsed_s = time.perf_counter() - t0
+        _print(f"        [process_one_image] human_detection: {detection_elapsed_s:.4f}s")
+        self.last_timings["detection_ms"] = detection_elapsed_s * 1000
 
         # If there are no detected humans, don't run prediction
         if len(boxes) == 0:
@@ -358,9 +351,9 @@ class SAM3DBodyEstimator:
             batch["cam_int"] = cam_int.clone()
         else:
             cam_int = batch["cam_int"].clone()
-        _t_fov = time.perf_counter() - t0
-        _print(f"        [process_one_image] fov_estimation: {_t_fov:.4f}s")
-        self.last_timings["fov_ms"] = _t_fov * 1000
+        fov_elapsed_s = time.perf_counter() - t0
+        _print(f"        [process_one_image] fov_estimation: {fov_elapsed_s:.4f}s")
+        self.last_timings["fov_ms"] = fov_elapsed_s * 1000
 
         t0 = time.perf_counter()
         torch.cuda.synchronize()
@@ -375,9 +368,9 @@ class SAM3DBodyEstimator:
             yolo_pose_body_boxes=yolo_pose_body_boxes,
         )
         torch.cuda.synchronize()
-        _t_model = time.perf_counter() - t0
-        _print(f"        [process_one_image] model_run_inference: {_t_model:.4f}s")
-        self.last_timings["model_ms"] = _t_model * 1000
+        model_elapsed_s = time.perf_counter() - t0
+        _print(f"        [process_one_image] model_run_inference: {model_elapsed_s:.4f}s")
+        self.last_timings["model_ms"] = model_elapsed_s * 1000
         self.last_timings["backbone_ms"] = getattr(self.model, "_last_backbone_ms", 0)
         self.last_timings["decoders_ms"] = getattr(self.model, "_last_decoders_ms", 0)
         if inference_type == "full":

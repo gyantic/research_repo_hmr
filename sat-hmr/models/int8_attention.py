@@ -4,9 +4,9 @@ from typing import Optional
 import torch
 
 
-def int8_attention_enabled(module: Optional[torch.nn.Module] = None) -> bool:
-    if module is not None and hasattr(module, "_sat_int8_attention_enabled"):
-        return bool(getattr(module, "_sat_int8_attention_enabled"))
+def int8_attention_enabled() -> bool:
+    # Read at call time (not import time) so video_demo.py's --int8_attn / --no_int8_attn,
+    # which set the variable before the model runs, take effect.
     return os.environ.get("SAT_HMR_INT8_ATTENTION") == "1"
 
 
@@ -83,7 +83,7 @@ def _ensure_int8_mm_supported(m: int, k: int, n: int, stage: str) -> None:
             "torchao int8 attention would fall back to CPU for "
             f"{stage}: mm({m}x{k}, {k}x{n}). "
             "Required for GPU int mm: m > 16, k % 8 == 0, n % 8 == 0. "
-            "Use `--allow_int8_attention_cpu_fallback` to force the slow path."
+            "Set SAT_HMR_INT8_ATTENTION_ALLOW_CPU_FALLBACK=1 to force the slow path."
         )
 
 
@@ -105,7 +105,7 @@ def torchao_int8_attention(
     if query.device.type != "cuda" and not int8_attention_cpu_fallback_allowed():
         raise RuntimeError(
             "torchao int8 attention requires CUDA for a usable path. "
-            "Use `--allow_int8_attention_cpu_fallback` to force the slow CPU fallback."
+            "Set SAT_HMR_INT8_ATTENTION_ALLOW_CPU_FALLBACK=1 to force the slow CPU fallback."
         )
 
     q_len = query.shape[-2]

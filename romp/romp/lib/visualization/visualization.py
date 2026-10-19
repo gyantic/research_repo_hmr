@@ -96,9 +96,6 @@ class Visualizer(object):
         if images is not None:
             if images.shape[1:3] != rendered_imgs.shape[1:3]:
                 images = np.array([cv2.resize(img, (rendered_imgs.shape[2], rendered_imgs.shape[1])) for img in images])
-            else:
-                images = images
-                
             valid_mask = (transparent > thresh)[:,:, :,np.newaxis]
             rendered_imgs = rendered_imgs * valid_mask * visible_weight + images * valid_mask * (1-visible_weight) + (1 - valid_mask) * images
         return rendered_imgs.astype(np.uint8)
@@ -170,13 +167,11 @@ class Visualizer(object):
         img_inds_org = [inds[0] for inds in per_img_inds]
         img_names = np.array(meta_data['imgpath'])[img_inds_org]
         org_imgs = meta_data['image'].cpu().numpy().astype(np.uint8)[img_inds_org]
-        #detection_flag = outputs['detection_flag'].sum()>0
+        # detection_flag is a per-person tensor, or already a bool after justify_detection_state.
         detection_flag = outputs['detection_flag']
         if isinstance(detection_flag, torch.Tensor):
             detection_flag = detection_flag.sum() > 0
-        elif isinstance(detection_flag, bool):
-            pass  # すでにboolなら何もしない
-        else:
+        elif not isinstance(detection_flag, bool):
             detection_flag = bool(detection_flag)
 
         plot_dict = OrderedDict()

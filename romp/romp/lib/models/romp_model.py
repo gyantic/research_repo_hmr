@@ -46,9 +46,6 @@ class ROMP(Base):
     def head_forward(self,x):
         #generate heatmap (K) + associate embedding (K)
         #kp_heatmap_ae = self.final_layers[0](x)
-        #x = torch.cat((x, self.coordmaps.to(x.device).repeat(x.shape[0],1,1,1)), 1)
-        
-        # 元のコードをコメントアウトして、これを挿入
         if self.coordmaps.shape[2:] != x.shape[2:]:
             # coordmapsを動的に再生成（入力サイズに合わせる）
             coordmaps = self.generate_coordmaps(x.shape[2:], x.device)

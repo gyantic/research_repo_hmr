@@ -23,10 +23,17 @@ import time
 import torch
 import torch.nn as nn
 
+from trt_calibration_frames import (
+    DEFAULT_CALIB_VIDEO,
+    DEFAULT_NUM_CALIB_FRAMES,
+    sample_video_frames_rgb,
+)
+
 # Default paths
 TRT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "moge_trt")
 ONNX_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_dinov2_encoder.onnx")
 TRT_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_dinov2_encoder_fp16.engine")
+INT8_CALIB_CACHE_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_int8_calib.cache")
 
 # Model config for MoGe2 ViT-S with resolution_level=0
 IMAGE_SIZE = 512
@@ -144,6 +151,51 @@ def export_onnx():
     print(f"File size: {os.path.getsize(ONNX_PATH) / 1024 / 1024:.2f} MB")
 
 
+def _make_video_calibrator(trt, video_path=DEFAULT_CALIB_VIDEO, num_frames=DEFAULT_NUM_CALIB_FRAMES):
+    """Build an IInt8EntropyCalibrator2 over video frames (FP16 RGB scaled to [0, 1]).
+
+    Takes the ``tensorrt`` module as an argument because TensorRT is imported lazily.
+    """
+
+    class _VideoCalibrator(trt.IInt8EntropyCalibrator2):
+        def __init__(self):
+            super().__init__()
+            frames = [
+                torch.from_numpy(frame).cuda().permute(2, 0, 1).half() / 255.0
+                for frame in sample_video_frames_rgb(
+                    video_path, num_frames, width=IMAGE_SIZE, height=IMAGE_SIZE
+                )
+            ]
+            print(f"  [MoGe Calibrator] Loaded {len(frames)} frames from {video_path}")
+
+            all_frames = torch.stack(frames)  # [N, 3, H, W]
+            self._batches = [
+                all_frames[i:i + BATCH_SIZE].contiguous()
+                for i in range(0, len(all_frames), BATCH_SIZE)
+            ]
+            self._next_batch_idx = 0
+
+        def get_batch_size(self):
+            return BATCH_SIZE
+
+        def get_batch(self, names):
+            if self._next_batch_idx >= len(self._batches):
+                return None
+            batch = self._batches[self._next_batch_idx]
+            self._next_batch_idx += 1
+            return [batch.data_ptr()]
+
+        def read_calibration_cache(self):
+            # Never reuse a cache: always calibrate from the current video frames.
+            return None
+
+        def write_calibration_cache(self, cache):
+            with open(INT8_CALIB_CACHE_PATH, "wb") as f:
+                f.write(cache)
+
+    return _VideoCalibrator()
+
+
 def convert_trt(use_int8=False):
     """Convert ONNX to TensorRT engine."""
     print("\n" + "=" * 60)
@@ -179,63 +231,8 @@ def convert_trt(use_int8=False):
 
     out_path = TRT_PATH
     if use_int8:
-        class _VideoCalibrator(trt.IInt8EntropyCalibrator2):
-            """INT8 calibrator using real video frames (FP16, normalized to [0, 1])."""
-            def __init__(self):
-                super().__init__()
-                self._cache = os.path.join(TRT_OUTPUT_DIR, "moge_int8_calib.cache")
-
-                import cv2
-                _video_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videos", "sample_video.mp4")
-                _num_frames = 200
-                cap = cv2.VideoCapture(_video_path)
-                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                step = max(1, total // _num_frames)
-                frames = []
-                for i in range(0, total, step):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame = cv2.resize(frame, (IMAGE_SIZE, IMAGE_SIZE))
-                    t = torch.from_numpy(frame).cuda().permute(2, 0, 1).half() / 255.0
-                    frames.append(t)
-                    if len(frames) >= _num_frames:
-                        break
-                cap.release()
-                print(f"  [MoGe Calibrator] Loaded {len(frames)} frames from {_video_path}")
-
-                all_frames = torch.stack(frames)  # [N, 3, H, W]
-                self._batches = [
-                    all_frames[i:i + BATCH_SIZE].contiguous()
-                    for i in range(0, len(all_frames), BATCH_SIZE)
-                ]
-                self._idx = 0
-
-            def get_batch_size(self): return BATCH_SIZE
-
-            def get_batch(self, names):
-                if self._idx >= len(self._batches):
-                    return None
-                batch = self._batches[self._idx]
-                self._idx += 1
-                return [batch.data_ptr()]
-
-            def read_calibration_cache(self):
-                return open(self._cache, "rb").read() if os.path.exists(self._cache) else None
-
-            def write_calibration_cache(self, cache):
-                open(self._cache, "wb").write(cache)
-
-        # Remove old random calibration cache to force fresh calibration
-        old_cache = os.path.join(TRT_OUTPUT_DIR, "moge_int8_calib.cache")
-        if os.path.exists(old_cache):
-            os.remove(old_cache)
-            print("  Removed old calibration cache")
-
         config.set_flag(trt.BuilderFlag.INT8)
-        config.int8_calibrator = _VideoCalibrator()
+        config.int8_calibrator = _make_video_calibrator(trt)
         out_path = TRT_PATH.replace("_fp16.engine", "_int8.engine")
 
     # Build engine
@@ -344,7 +341,7 @@ def main():
     parser.add_argument("--convert_trt", action="store_true", help="Convert ONNX to TensorRT")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark PyTorch vs TensorRT")
     parser.add_argument("--all", action="store_true", help="Run all steps")
-    parser.add_argument("--int8", action="store_true", help="Enable INT8+FP16 (random calibration, speed test only)")
+    parser.add_argument("--int8", action="store_true", help="Enable INT8+FP16 (entropy calibration on 200 frames of datasets/videos/sample_video.mp4)")
 
     args = parser.parse_args()
 

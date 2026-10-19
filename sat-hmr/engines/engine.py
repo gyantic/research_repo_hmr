@@ -13,6 +13,7 @@ import re
 import time
 import datetime
 from models import build_sat_model
+from sathmr_common import dequantize_int8_weight_state_dict_if_needed, is_bf16
 from .funcs.eval_funcs import *
 from .funcs.infer_funcs import inference
 from utils import misc
@@ -22,35 +23,6 @@ import numpy as np
 
 assert version.parse(accelerate.__version__) >= version.parse("1.10.0"),\
       "Please use accelerate >= 1.10.0 to support our updated implementation of distributed evaluation (August 30, 2025)."
-
-
-def is_bf16(dtype_cfg):
-    return str(dtype_cfg).lower() in {"bfloat16", "bf16", "bfp16"}
-
-
-def dequantize_int8_weight_state_dict_if_needed(state_dict):
-    int8_keys = [k for k in state_dict if k.endswith(".weight_int8")]
-    if not int8_keys:
-        return state_dict, {"loaded_int8_weight_file": False, "dequantized_tensors": 0}
-
-    restored = {}
-    for key, tensor in state_dict.items():
-        if key.endswith(".weight_int8"):
-            base = key[: -len("_int8")]
-            scale_key = base + "_scale"
-            if scale_key not in state_dict:
-                raise KeyError(f"Missing INT8 weight scale for {key}: expected {scale_key}")
-            scale = state_dict[scale_key].float().unsqueeze(1)
-            restored[base] = tensor.float() * scale
-        elif key.endswith(".weight_scale"):
-            continue
-        else:
-            restored[key] = tensor
-
-    return restored, {
-        "loaded_int8_weight_file": True,
-        "dequantized_tensors": len(int8_keys),
-    }
 
 
 def apply_torchao_int4(model, skip_modules=(), group_size=128):
@@ -65,7 +37,6 @@ def apply_torchao_int4(model, skip_modules=(), group_size=128):
             return False
         if skip_modules and any(s in fqn for s in skip_modules):
             return False
-        import torch
         w = module.weight
         if type(w) not in (torch.Tensor, nn.Parameter):
             return False

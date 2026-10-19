@@ -14,8 +14,6 @@ from torch import nn, Tensor
 from torch.nn.init import constant_
 
 from models.int8_attention import int8_attention_enabled, torchao_int8_attention
-from .grouped_linear import GroupedLinearReference
-from .triton_grouped_int8 import GroupedInt8LinearTriton
 from .position_encoding import position_encoding_xy
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
@@ -66,25 +64,19 @@ class MLP(nn.Module):
         return x
 
 
+# The three subclasses below are plain MLPs. They exist only so that profiler
+# traces and torch.compile graph-break logs show which decoder MLP a frame
+# belongs to; parameter names (and therefore checkpoint keys) are unchanged.
 class QueryScaleMLP(MLP):
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+    pass
 
 
 class RefPointHeadMLP(MLP):
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+    pass
 
 
 class RefAnchorHeadMLP(MLP):
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+    pass
 
 class TransformerDecoder(nn.Module):
     def __init__(self, d_model=512, nhead=8, num_queries=300, 
@@ -156,52 +148,6 @@ class TransformerDecoder(nn.Module):
                           pos=pos_embed, refpoints_unsigmoid=refpoint_embed,
                           self_attn_bias = self_attn_bias)
         return hs, references
-
-    def set_grouped_query_proj(
-        self,
-        enabled: bool,
-        impl: str = "bmm",
-        target: str = "both",
-    ) -> None:
-        if target not in {"both", "self", "cross"}:
-            raise ValueError(f"Unsupported target: {target}")
-        for layer in self.decoder.layers:
-            if hasattr(layer, "use_grouped_self_query_proj") and target in {"both", "self"}:
-                layer.use_grouped_self_query_proj = bool(enabled)
-            if hasattr(layer, "use_grouped_cross_query_proj") and target in {"both", "cross"}:
-                layer.use_grouped_cross_query_proj = bool(enabled)
-            if hasattr(layer, "grouped_query_proj_impl"):
-                layer.grouped_query_proj_impl = impl
-            if hasattr(layer, "rebuild_grouped_query_proj_refs"):
-                layer.rebuild_grouped_query_proj_refs()
-
-    def set_fused_int8_query_proj(
-        self,
-        enabled: bool,
-        target: str = "self",
-    ) -> None:
-        if target not in {"self"}:
-            raise ValueError(f"Unsupported target: {target}")
-        for layer in self.decoder.layers:
-            if hasattr(layer, "use_fused_int8_self_query_proj") and target == "self":
-                layer.use_fused_int8_self_query_proj = bool(enabled)
-                layer.use_fused_input_int8_self_query_proj = False
-            if hasattr(layer, "rebuild_grouped_query_proj_refs"):
-                layer.rebuild_grouped_query_proj_refs()
-
-    def set_fused_input_int8_query_proj(
-        self,
-        enabled: bool,
-        target: str = "self",
-    ) -> None:
-        if target not in {"self"}:
-            raise ValueError(f"Unsupported target: {target}")
-        for layer in self.decoder.layers:
-            if hasattr(layer, "use_fused_input_int8_self_query_proj") and target == "self":
-                layer.use_fused_input_int8_self_query_proj = bool(enabled)
-                layer.use_fused_int8_self_query_proj = False
-            if hasattr(layer, "rebuild_grouped_query_proj_refs"):
-                layer.rebuild_grouped_query_proj_refs()
 
 
 class XformerDecoder(nn.Module):
@@ -371,67 +317,8 @@ class XformerDecoderLayer(nn.Module):
 
         self.activation = _get_activation_fn(activation)
         self.keep_query_pos = keep_query_pos
-        self.use_grouped_self_query_proj = False
-        self.use_grouped_cross_query_proj = False
-        self.use_fused_int8_self_query_proj = False
-        self.use_fused_input_int8_self_query_proj = False
-        self.grouped_query_proj_impl = "bmm"
-        self.grouped_sa_query_proj_ref = None
-        self.grouped_ca_query_proj_ref = None
-        self.fused_int8_sa_query_proj_ref = None
-        self.rebuild_grouped_query_proj_refs()
-
-    def rebuild_grouped_query_proj_refs(self) -> None:
-        self.grouped_sa_query_proj_ref = GroupedLinearReference.from_linears(
-            [
-                self.sa_qcontent_proj,
-                self.sa_qpos_proj,
-                self.sa_kcontent_proj,
-                self.sa_kpos_proj,
-                self.sa_v_proj,
-            ],
-            impl=self.grouped_query_proj_impl,
-        )
-        if GroupedInt8LinearTriton.is_supported():
-            self.fused_int8_sa_query_proj_ref = GroupedInt8LinearTriton.from_linears(
-                [
-                    self.sa_qcontent_proj,
-                    self.sa_qpos_proj,
-                    self.sa_kcontent_proj,
-                    self.sa_kpos_proj,
-                    self.sa_v_proj,
-                ]
-            )
-        else:
-            self.fused_int8_sa_query_proj_ref = None
-
-        ca_linears = [self.ca_qcontent_proj]
-        if self.ca_qpos_proj is not None:
-            ca_linears.append(self.ca_qpos_proj)
-        ca_linears.append(self.ca_qpos_sine_proj)
-        self.grouped_ca_query_proj_ref = GroupedLinearReference.from_linears(
-            ca_linears,
-            impl=self.grouped_query_proj_impl,
-        )
 
     def forward_self_query_proj(self, tgt: Tensor, query_pos: Tensor):
-        if self.use_fused_input_int8_self_query_proj and self.fused_int8_sa_query_proj_ref is not None:
-            grouped = self.fused_int8_sa_query_proj_ref.forward_fused_input(
-                torch.stack([tgt, query_pos, tgt, query_pos, tgt], dim=0),
-                out_dtype=tgt.dtype,
-            )
-            return tuple(grouped.unbind(dim=0))
-        if self.use_fused_int8_self_query_proj and self.fused_int8_sa_query_proj_ref is not None:
-            grouped = self.fused_int8_sa_query_proj_ref(
-                torch.stack([tgt, query_pos, tgt, query_pos, tgt], dim=0)
-            )
-            return tuple(grouped.unbind(dim=0))
-        if self.use_grouped_self_query_proj and self.grouped_sa_query_proj_ref is not None:
-            grouped = self.grouped_sa_query_proj_ref(
-                torch.stack([tgt, query_pos, tgt, query_pos, tgt], dim=0)
-            )
-            return tuple(grouped.unbind(dim=0))
-
         return (
             self.sa_qcontent_proj(tgt),
             self.sa_qpos_proj(query_pos),
@@ -441,25 +328,9 @@ class XformerDecoderLayer(nn.Module):
         )
 
     def forward_cross_query_proj(self, tgt: Tensor, query_pos: Tensor, query_sine_embed: Tensor):
-        use_query_pos = self.ca_qpos_proj is not None
-        if self.use_grouped_cross_query_proj and self.grouped_ca_query_proj_ref is not None:
-            inputs = [tgt]
-            if use_query_pos:
-                inputs.append(query_pos)
-            inputs.append(query_sine_embed)
-            grouped = self.grouped_ca_query_proj_ref(torch.stack(inputs, dim=0))
-            outputs = list(grouped.unbind(dim=0))
-            q_content = outputs[0]
-            if use_query_pos:
-                q_pos = outputs[1]
-                query_sine = outputs[2]
-            else:
-                q_pos = None
-                query_sine = outputs[1]
-            return q_content, q_pos, query_sine
-
         q_content = self.ca_qcontent_proj(tgt)
-        q_pos = self.ca_qpos_proj(query_pos) if use_query_pos else None
+        # ca_qpos_proj is None for layers that do not keep the query position (keep_query_pos=False, not first layer).
+        q_pos = self.ca_qpos_proj(query_pos) if self.ca_qpos_proj is not None else None
         query_sine = self.ca_qpos_sine_proj(query_sine_embed)
         return q_content, q_pos, query_sine
 
@@ -515,11 +386,10 @@ class XformerDecoderLayer(nn.Module):
         else:
             bias = None
             
-        if XFORMERS_AVAILABLE and not int8_attention_enabled(self):
+        if XFORMERS_AVAILABLE and not int8_attention_enabled():
             tgt2 = memory_efficient_attention(q, k, v, attn_bias=bias)
         else:
-            tgt2 = torch_attention(q, k, v, attn_bias=bias, module=self)
-        #tgt2 = memory_efficient_attention(q, k, v, attn_bias=self_attn_bias.to(q.dtype) if self_attn_bias is not None else None)
+            tgt2 = torch_attention(q, k, v, attn_bias=bias)
         tgt2 = self.sa_out_proj(tgt2.reshape(L_tgt, self.d_model))
 
         tgt = tgt_b4n + self.dropout1(tgt2)
@@ -559,7 +429,7 @@ class XformerDecoderLayer(nn.Module):
         v = v.view(1, L_mem, self.nhead, self.d_model//self.nhead)
 
         single_batch = len(tgt_lens) == 1 and len(memory_lens) == 1
-        if XFORMERS_AVAILABLE and not int8_attention_enabled(self):
+        if XFORMERS_AVAILABLE and not int8_attention_enabled():
             # #6a: single_batch なら BlockDiagonalMask 不要 → get_decoder_block_diag_bias の
             # @_dynamo.disable 境界をスキップして GB 解消狙い。
             if single_batch:
@@ -573,7 +443,7 @@ class XformerDecoderLayer(nn.Module):
             attn_bias = None if single_batch else TransformerDecoder.block_diag_bias_from_lens(
                 tgt_lens, memory_lens, device=q.device, dtype=q.dtype
             )
-            tgt2 = torch_attention(q, k, v, attn_bias=attn_bias, module=self)
+            tgt2 = torch_attention(q, k, v, attn_bias=attn_bias)
         tgt2 = self.ca_out_proj(tgt2.reshape(L_tgt, self.d_model))
 
         tgt = tgt_b4n + self.dropout2(tgt2)
@@ -618,10 +488,10 @@ def build_decoder(args):
     )
 
 
-def torch_attention(query, key, value, attn_bias=None, module=None):
+def torch_attention(query, key, value, attn_bias=None):
     scale = 1.0 / query.shape[-1] ** 0.5
     query = query * scale
-    if int8_attention_enabled(module):
+    if int8_attention_enabled():
         return torchao_int8_attention(
             query,
             key,

@@ -1,4 +1,5 @@
 
+import os
 from .base import *
 from loss_funcs import _calc_MPJAE, calc_mpjpe, calc_pampjpe, calc_pck, align_by_parts
 from evaluation import h36m_evaluation_act_wise, cmup_evaluation_act_wise
@@ -8,15 +9,21 @@ from evaluation.evaluation_matrix import _calc_relative_age_error_weak_, _calc_a
 
 # H36M14 (SAT-HMR-aligned) eval: regress H36M joints from SMPL verts, take the 14 common joints.
 H36M14_INDS = [1, 2, 3, 4, 5, 6, 8, 10, 11, 12, 13, 14, 15, 16]
-_H36M_REG_PATH = '/home/kyuta/SAT-HMR/weights/smpl_data/smpl/J_regressor_h36m_correct.npy'
+_H36M_REG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'body_models', 'smpl', 'J_regressor_h36m_correct.npy')
 _H36M_REG_CACHE = {}
 
 def _get_h36m_reg(device, dtype):
     key = (str(device), str(dtype))
     if key not in _H36M_REG_CACHE:
-        import numpy as _np
-        _H36M_REG_CACHE[key] = torch.from_numpy(_np.load(_H36M_REG_PATH)).to(device=device, dtype=dtype)
+        _H36M_REG_CACHE[key] = torch.from_numpy(np.load(_H36M_REG_PATH)).to(device=device, dtype=dtype)
     return _H36M_REG_CACHE[key]
+
+def _add_mean_median_mad(eval_results, name, errors_mm):
+    """Store mean, median and median absolute deviation of a 1-D error tensor (mm)."""
+    median = errors_mm.median()
+    eval_results[name] = errors_mm.mean()
+    eval_results[name + '_median'] = median
+    eval_results[name + '_mad'] = (errors_mm - median).abs().median()
 
 
 def calc_outputs_evaluation_matrix(self, outputs, ED):
@@ -82,11 +89,11 @@ def calc_outputs_evaluation_matrix(self, outputs, ED):
                 verts_pred_pa, _ = batch_compute_similarity_transform_torch(verts_pred, verts_gt)
                 batch_PA_PVE = torch.norm(verts_gt - verts_pred_pa, p=2, dim=-1).mean(-1)
                 ED['PA_PVE_new'][ds].append(batch_PA_PVE)
-                # H36M14 (SAT-HMR-aligned) MPJPE / PA-MPJPE from SMPL vertices (float32; SVD needs float)
-                _vp32 = verts_pred.float(); _vg32 = verts_gt.float()
-                h36m_reg = _get_h36m_reg(_vp32.device, _vp32.dtype)
-                pj = torch.einsum('jv,bvd->bjd', h36m_reg, _vp32)
-                gj = torch.einsum('jv,bvd->bjd', h36m_reg, _vg32)
+                # H36M14 (SAT-HMR-aligned) MPJPE / PA-MPJPE from SMPL vertices
+                # (verts_pred/verts_gt are float32 above: the SVD in the Procrustes alignment needs float)
+                h36m_reg = _get_h36m_reg(verts_pred.device, verts_pred.dtype)
+                pj = torch.einsum('jv,bvd->bjd', h36m_reg, verts_pred)
+                gj = torch.einsum('jv,bvd->bjd', h36m_reg, verts_gt)
                 pj14 = (pj - pj[:, 0:1])[:, H36M14_INDS]
                 gj14 = (gj - gj[:, 0:1])[:, H36M14_INDS]
                 ED['H36M14_MPJPE'][ds].append((torch.norm(pj14 - gj14, p=2, dim=-1).mean(-1) * 1000).detach().cpu())
@@ -231,26 +238,15 @@ def print_results(ED):
 
     if args().calc_PVE_error:
         for ds_name in constants.PVE_ds:
+            # PVE / PA_PVE are collected in metres; H36M14 errors are already in mm.
             if len(ED['PVE_new'][ds_name])>0:
-                _pv = torch.cat(ED['PVE_new'][ds_name], 0) * 1000
-                eval_results['{}-PVE'.format(ds_name)] = _pv.mean()
-                eval_results['{}-PVE_median'.format(ds_name)] = _pv.median()
-                eval_results['{}-PVE_mad'.format(ds_name)] = (_pv - _pv.median()).abs().median()
+                _add_mean_median_mad(eval_results, '{}-PVE'.format(ds_name), torch.cat(ED['PVE_new'][ds_name], 0) * 1000)
             if len(ED['PA_PVE_new'][ds_name])>0:
-                _pap = torch.cat(ED['PA_PVE_new'][ds_name], 0) * 1000
-                eval_results['{}-PA_PVE'.format(ds_name)] = _pap.mean()
-                eval_results['{}-PA_PVE_median'.format(ds_name)] = _pap.median()
-                eval_results['{}-PA_PVE_mad'.format(ds_name)] = (_pap - _pap.median()).abs().median()
+                _add_mean_median_mad(eval_results, '{}-PA_PVE'.format(ds_name), torch.cat(ED['PA_PVE_new'][ds_name], 0) * 1000)
             if len(ED['H36M14_MPJPE'][ds_name])>0:
-                _h = torch.cat(ED['H36M14_MPJPE'][ds_name], 0)
-                eval_results['{}-H36M14_MPJPE'.format(ds_name)] = _h.mean()
-                eval_results['{}-H36M14_MPJPE_median'.format(ds_name)] = _h.median()
-                eval_results['{}-H36M14_MPJPE_mad'.format(ds_name)] = (_h - _h.median()).abs().median()
+                _add_mean_median_mad(eval_results, '{}-H36M14_MPJPE'.format(ds_name), torch.cat(ED['H36M14_MPJPE'][ds_name], 0))
             if len(ED['H36M14_PA'][ds_name])>0:
-                _hp = torch.cat(ED['H36M14_PA'][ds_name], 0)
-                eval_results['{}-H36M14_PA'.format(ds_name)] = _hp.mean()
-                eval_results['{}-H36M14_PA_median'.format(ds_name)] = _hp.median()
-                eval_results['{}-H36M14_PA_mad'.format(ds_name)] = (_hp - _hp.median()).abs().median()
+                _add_mean_median_mad(eval_results, '{}-H36M14_PA'.format(ds_name), torch.cat(ED['H36M14_PA'][ds_name], 0))
 
     for ds_name in constants.MPJAE_ds:
         if ds_name in ED['MPJAE']:

@@ -26,7 +26,7 @@ class Demo(Base):
             data_loader = self._create_single_data_loader(dataset='pw3d', train_flag = False, split='all', mode='PC')
         elif self.eval_dataset == 'pw3d_nc':
             data_loader = self._create_single_data_loader(dataset='pw3d', train_flag = False, split='all', mode='NC')
-        eval_results = val_result(self,loader_val=data_loader, evaluation=True)
+        return val_result(self,loader_val=data_loader, evaluation=True)
 
     def net_forward(self,meta_data,mode='val'):
         if mode=='val':

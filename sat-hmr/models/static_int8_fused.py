@@ -12,7 +12,7 @@ Replaces torchao dynamic INT8 on encoder DINO MLPs and decoder FFNs.
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Iterable, Mapping
 
 import torch
 import torch.nn as nn
@@ -316,9 +316,8 @@ def _static_int8_fused_mlp_call(self: "StaticInt8FusedMLP", x: torch.Tensor) -> 
 class _MlpScaleCollector:
     """Collect input absmax and post-(fc1+act) absmax via forward pre-hooks."""
 
-    def __init__(self, fc1: nn.Linear, fc2: nn.Linear, activation: str) -> None:
+    def __init__(self, fc1: nn.Linear, activation: str) -> None:
         self.fc1 = fc1
-        self.fc2 = fc2
         self.activation = activation
         self.input_max = 0.0
         self.inter_max = 0.0
@@ -360,18 +359,6 @@ class _MlpScaleCollector:
         )
 
 
-def collect_mlp_scales(
-    model: nn.Module,
-    targets: Sequence[tuple[str, nn.Module, nn.Linear, nn.Linear, str]],
-) -> dict[str, tuple[float, float]]:
-    """Register hooks on parents of (fc1, fc2) and return scales after caller runs the model.
-
-    Returns a dict {target_key: (input_scale, inter_scale)}.
-    Hooks must be removed by caller via remove_calibration_hooks below.
-    """
-    return {}
-
-
 class CalibrationHooks:
     """Context manager that registers forward pre-hooks for calibration."""
 
@@ -382,8 +369,8 @@ class CalibrationHooks:
         self._handles: list = []
 
     def __enter__(self):
-        for key, hook_target, _swap_owner, fc1, fc2, act in self.targets:
-            collector = _MlpScaleCollector(fc1, fc2, act)
+        for key, hook_target, _swap_owner, fc1, _fc2, act in self.targets:
+            collector = _MlpScaleCollector(fc1, act)
             self.collectors[key] = collector
             handle = hook_target.register_forward_pre_hook(collector)
             self._handles.append(handle)

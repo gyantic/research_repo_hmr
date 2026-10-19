@@ -6,28 +6,27 @@ SAT-HMR Video Demo (ONNX Runtime)
 
 import argparse
 import csv
-import math
 import os
 import socket
 import sys
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
-from scipy.spatial.transform import Rotation
-from torchvision import transforms
 
 from configs.paths import smpl_model_path
 from models.human_models import SMPL_Layer
 from utils.transforms import unNormalize
-
-ARRAY2TENSOR = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-])
+from sathmr_common import (
+    build_cam_intrinsics_from_img_size,
+    preprocess_frame,
+    select_udp_target,
+    setup_render_imports,
+    smpl_pose_to_ue_quaternions,
+    transl_to_ue,
+)
 
 
 def get_args():
@@ -66,113 +65,6 @@ def get_args():
     parser.add_argument('--udp_jump_cooldown', type=int, default=6)
 
     return parser.parse_args()
-
-
-def process_img_like_base(img, input_size):
-    ori_h, ori_w = img.shape[:2]
-    if ori_w >= ori_h:
-        resize_rate = input_size / ori_w
-        new_w = input_size
-        new_h = int(resize_rate * ori_h)
-    else:
-        resize_rate = input_size / ori_h
-        new_h = input_size
-        new_w = int(resize_rate * ori_w)
-
-    img_resized = cv2.resize(img, (new_w, new_h))
-    img_size = (new_h, new_w)
-    return img_resized, img_size, resize_rate
-
-
-def preprocess_frame(frame, input_size, use_sat=True):
-    img_resized, img_size, _ = process_img_like_base(frame, input_size)
-
-    patch_size = 56 if use_sat else 14
-    pad_h = (img_size[0] + patch_size - 1) // patch_size * patch_size
-    pad_w = (img_size[1] + patch_size - 1) // patch_size * patch_size
-
-    pad_img = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-    pad_img[:img_size[0], :img_size[1]] = img_resized
-
-    pil_img = Image.fromarray(pad_img[:, :, ::-1].copy())
-    norm_img = ARRAY2TENSOR(pil_img)
-
-    return norm_img, img_size, frame.shape[:2]
-
-
-def smpl_pose_to_ue_quaternions(pose):
-    rotations = Rotation.from_rotvec(pose.reshape(-1, 3))
-    quaternions = rotations.as_quat().astype(np.float32)
-    quaternions[:, 0] *= -1.0
-    quaternions[:, 2] *= -1.0
-    flip_root = np.array([1., 0., 0., 0.], dtype=np.float32)
-    quaternions[0] = (
-        Rotation.from_quat(flip_root) * Rotation.from_quat(quaternions[0])
-    ).as_quat().astype(np.float32)
-    return quaternions
-
-
-def transl_to_ue(transl):
-    trans = transl.copy().astype(np.float32)
-    trans[1] *= -1.0
-    trans[2] = 0.0
-    return trans * 100.0
-
-
-def select_udp_target(cands, tracker_state, max_dist_cm, reinit_conf):
-    if len(cands['confs']) == 0:
-        return None, tracker_state, None
-
-    confs = cands['confs']
-    poses = cands['poses']
-    transls = cands['transls']
-    query_ids = cands['query_ids']
-
-    best_idx = int(np.argmax(confs))
-    reason = 'max_conf'
-
-    if tracker_state['active'] and tracker_state['transl'] is not None:
-        dists_cm = np.linalg.norm(transls - tracker_state['transl'][None, :], axis=1) * 100.0
-        near_idx = int(np.argmin(dists_cm))
-        near_dist = float(dists_cm[near_idx])
-        near_conf = float(confs[near_idx])
-        best_conf = float(confs[best_idx])
-
-        if near_dist <= max_dist_cm:
-            best_idx = near_idx
-            reason = f'nearest:{near_dist:.1f}cm'
-        elif best_conf >= reinit_conf:
-            reason = f'reinit_conf:{best_conf:.3f}'
-        else:
-            return None, tracker_state, f'skip_jump nearest={near_dist:.1f}cm conf={near_conf:.3f}'
-
-    selected = {
-        'pose': poses[best_idx],
-        'transl': transls[best_idx],
-        'conf': float(confs[best_idx]),
-        'query_id': int(query_ids[best_idx]),
-        'num_persons': len(confs),
-    }
-
-    tracker_state['active'] = True
-    tracker_state['transl'] = transls[best_idx].copy()
-    tracker_state['query_id'] = int(query_ids[best_idx])
-    tracker_state['missed'] = 0
-    return selected, tracker_state, reason
-
-
-def build_cam_intrinsics_from_img_size(img_size_hw: Tuple[int, int], input_size: int) -> np.ndarray:
-    h, w = img_size_hw
-    focal = input_size / (2.0 * math.tan(math.pi / 6.0))
-    K = np.array(
-        [
-            [focal, 0.0, w / 2.0],
-            [0.0, focal, h / 2.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    return K
 
 
 class OnnxRunner:
@@ -387,37 +279,6 @@ def process_frame_onnx(
     times['render'] = time.time() - t0
 
     return result_img, num_persons, times, udp_candidates
-
-
-def setup_render_imports(no_render: bool):
-    if no_render:
-        return True, None
-
-    try:
-        # Keep same workaround order as webcam_demo.py
-        os.environ.setdefault('PYOPENGL_PLATFORM', 'pyglet')
-        import pyrender  # noqa: F401
-
-        def force_windows_create(self):
-            from pyrender.platforms import pyglet_platform
-            from pyrender.renderer import Renderer
-            self._platform = pyglet_platform.PygletPlatform(self.viewport_width, self.viewport_height)
-            self._platform.init_context()
-            self._renderer = Renderer(self.viewport_width, self.viewport_height)
-
-        pyrender.OffscreenRenderer._create = force_windows_create
-
-        from utils.visualization import tensor_to_BGR, pad_img, vis_meshes_img, get_colors_rgb
-
-        return True, {
-            'tensor_to_BGR': tensor_to_BGR,
-            'pad_img': pad_img,
-            'vis_meshes_img': vis_meshes_img,
-            'get_colors_rgb': get_colors_rgb,
-        }
-    except Exception as exc:
-        print(f'[WARN] Render modules import failed. Continue with no_render=True. ({exc})')
-        return False, None
 
 
 def main():

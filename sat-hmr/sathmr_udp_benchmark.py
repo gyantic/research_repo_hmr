@@ -3,13 +3,18 @@ SAT-HMR Benchmark with UDP (測定用)
 ROMPと同様の形式でSMPLパラメータをUEに送信 + 統計計測
 """
 
-import socket, time, sys, pathlib, csv, yaml, numpy as np
-from scipy.spatial.transform import Rotation
-import cv2, torch, random
+import socket, time, sys, pathlib, csv, numpy as np
+import cv2, torch
 import os
-from PIL import Image
-from torchvision import transforms
 import argparse
+from sathmr_common import (
+    infer_frame,
+    load_config,
+    resolve_device,
+    setup_reproducibility,
+    smpl_pose_to_ue_quaternions,
+    transl_to_ue,
+)
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -18,43 +23,12 @@ def parse_args():
 
 # ========= Seed固定 =========
 SEED = 42
-
-
-def setup_reproducibility(seed: int = 42):
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    random.seed(seed)
-    np.random.seed(seed)
-    cv2.setRNGSeed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.allow_tf32 = False
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
 setup_reproducibility(SEED)
 
 # ========= 実行設定 =========
 DEVICE_MODE = os.getenv("SATHMR_DEVICE_MODE", "auto")  # "auto" | "cpu" | "cuda"
 CPU_THREADS = int(os.getenv("SATHMR_CPU_THREADS", "2"))
 CPU_INTEROP_THREADS = int(os.getenv("SATHMR_CPU_INTEROP_THREADS", "1"))
-
-
-def resolve_device(mode: str) -> torch.device:
-    mode = mode.lower()
-    if mode == "cpu":
-        return torch.device("cpu")
-    if mode == "cuda":
-        if not torch.cuda.is_available():
-            print("[WARN] DEVICE_MODE=cuda ですが CUDA が利用できないため CPU にフォールバックします")
-            return torch.device("cpu")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 torch.set_num_threads(CPU_THREADS)
@@ -82,138 +56,6 @@ print(f"[INFO] CSV output: {STATS_CSV}")
 
 # ========= SAT-HMR インポート =========
 from models import build_sat_model
-from utils.transforms import unNormalize
-
-
-def load_config(input_size):
-    """SAT-HMRの設定を読み込み"""
-    demo_cfg_path = os.path.join('configs', 'run', 'demo.yaml')
-    with open(demo_cfg_path) as f:
-        demo_config = yaml.safe_load(f)
-    
-    model_name = demo_config.get('model', 'default')
-    model_cfg_path = os.path.join('configs', 'models', f'{model_name}.yaml')
-    with open(model_cfg_path) as f:
-        model_config = yaml.safe_load(f)
-    
-    class Config:
-        pass
-    
-    args = Config()
-    for k, v in model_config.items():
-        setattr(args, k, v)
-    for k, v in demo_config.items():
-        setattr(args, k, v)
-    
-    args.mode = 'infer'
-    args.pretrain = False
-    args.pretrain_path = None
-    args.input_size = input_size
-    
-    return args
-
-
-def process_img_like_base(img, input_size):
-    """BASEクラスのprocess_imgと同じ処理"""
-    ori_h, ori_w = img.shape[:2]
-    
-    if ori_w >= ori_h:
-        resize_rate = input_size / ori_w
-        new_w = input_size
-        new_h = int(resize_rate * ori_h)
-    else:
-        resize_rate = input_size / ori_h
-        new_h = input_size
-        new_w = int(resize_rate * ori_w)
-    
-    img_resized = cv2.resize(img, (new_w, new_h))
-    img_size = (new_h, new_w)
-    
-    return img_resized, img_size, resize_rate
-
-
-def preprocess_frame(frame, input_size, use_sat=True):
-    """フレームを前処理"""
-    img_resized, img_size, resize_rate = process_img_like_base(frame, input_size)
-    
-    patch_size = 56 if use_sat else 14
-    pad_h = (img_size[0] + patch_size - 1) // patch_size * patch_size
-    pad_w = (img_size[1] + patch_size - 1) // patch_size * patch_size
-    
-    pad_img = np.zeros((pad_h, pad_w, 3), dtype=np.uint8)
-    pad_img[:img_size[0], :img_size[1]] = img_resized
-    
-    pil_img = Image.fromarray(pad_img[:, :, ::-1].copy())
-    
-    array2tensor = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-    
-    norm_img = array2tensor(pil_img)
-    
-    return norm_img, img_size
-
-
-def infer_frame(model, frame, input_size, conf_thresh, device):
-    """1フレームを推論してSMPLパラメータを返す"""
-    img_tensor, img_size = preprocess_frame(frame, input_size, use_sat=True)
-    img_tensor = img_tensor.to(device)
-    
-    targets = [{
-        'img_size': torch.tensor(img_size).to(device),
-        'img_path': 'video_frame'
-    }]
-    
-    with torch.no_grad():
-        outputs = model([img_tensor], targets)
-    
-    idx = 0
-    confs = outputs['pred_confs'][idx].squeeze(-1)
-    select_idx = torch.where(confs > conf_thresh)[0]
-    
-    detection_flag = len(select_idx) > 0
-    
-    if not detection_flag:
-        return {'detection_flag': False}
-    
-    # 最も信頼度の高い人物を選択
-    best_idx = select_idx[confs[select_idx].argmax()]
-    
-    result = {
-        'detection_flag': True,
-        'pose': outputs['pred_poses'][idx][best_idx].detach().cpu().numpy(),      # (72,)
-        'betas': outputs['pred_betas'][idx][best_idx].detach().cpu().numpy(),     # (10,)
-        'transl': outputs['pred_transl'][idx][best_idx].detach().cpu().numpy(),   # (3,)
-        'conf': confs[best_idx].detach().cpu().item(),
-    }
-    
-    return result
-
-
-def smpl_pose_to_ue_quaternions(pose):
-    """SMPLポーズ(72,)をUE用クォータニオン(24, 4)に変換"""
-    rotations = Rotation.from_rotvec(pose.reshape(-1, 3))
-    quats = rotations.as_quat().astype(np.float32)  # (24, 4) = (x, y, z, w)
-    
-    # UE座標系への変換
-    quats[:, 0] *= -1.0
-    quats[:, 2] *= -1.0
-    
-    # ルート回転の補正
-    flip_root = np.array([1., 0., 0., 0.], dtype=np.float32)
-    quats[0] = (Rotation.from_quat(flip_root) * Rotation.from_quat(quats[0])).as_quat().astype(np.float32)
-    
-    return quats
-
-
-def transl_to_ue(transl):
-    """SMPL translationをUE座標系に変換"""
-    trans = transl.copy().astype(np.float32)
-    trans[1] *= -1.0
-    trans[2] = 0.0
-    trans = trans * 100.0  # m -> cm
-    return trans
 
 
 # ---- UDP（HELLO待ち→送信先確定）----
@@ -221,7 +63,7 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind(("0.0.0.0", LOCAL_PORT))
 print(f"[WAIT] HELLO on 0.0.0.0:{LOCAL_PORT}")
-data, addr = sock.recvfrom(2048)
+_, addr = sock.recvfrom(2048)
 UE_HOST = addr[0]
 print(f"[HELLO] from {addr} -> dst={(UE_HOST, UE_PORT)}")
 time_connection_success = time.perf_counter()
@@ -235,9 +77,8 @@ state_dict = torch.load('./weights/sat_hmr/sat_644.pth', map_location='cpu', wei
 model.load_state_dict(state_dict, strict=False)
 
 device = resolve_device(DEVICE_MODE)
-"""
-引数設定
-"""
+
+# ---- 引数設定 ----
 args = parse_args()
 dtype = args.dtype_cfg
 
