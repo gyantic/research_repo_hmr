@@ -153,7 +153,7 @@ body_models/smpl/
 
 ### UEパッケージの作成
 
-UEパッケージ（Normal・RockDrop・SphereOrbit）はSMPLを含むため配布していません。GitHub Releasesで配布しているUEプロジェクトに、[モデルの取得と配置](#モデルの取得と配置)で用意した `body_models/smpl/SMPL_FEMALE.pkl` から作った人体を配置してから作成します。
+UEパッケージ（Normal・RockDrop・SphereOrbit）は、SMPLの人体とFabで入手するSocketClientプラグインが組み込まれるため配布していません。GitHub Releasesで配布しているUEプロジェクト（どちらも含まない）に、[モデルの取得と配置](#モデルの取得と配置)で用意した `body_models/smpl/SMPL_FEMALE.pkl` から作った人体を配置してから作成します。
 
 必要なもの：
 
@@ -198,7 +198,7 @@ UEパッケージ（Normal・RockDrop・SphereOrbit）はSMPLを含むため配�
    powershell -ExecutionPolicy Bypass -File Tools\package-recording.ps1
    ```
 
-作成したパッケージや、生成される `Interchange/SMPL.glb`・`Content/SMPL.uasset`・`Content/SMPL_Skeleton.uasset` はSMPLを含むため、再配布しないでください。
+作成したパッケージはSMPLとSocketClientプラグインを含むため、再配布しないでください。生成される `Interchange/SMPL.glb`・`Content/SMPL.uasset`・`Content/SMPL_Skeleton.uasset` もSMPLを含むため同様です。
 
 ### 実行と出力
 

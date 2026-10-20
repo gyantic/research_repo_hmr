@@ -60,7 +60,7 @@ UEパッケージは、GitHub Releasesで配布しているUEプロジェクト�
 
    パッケージは `Deliverables/{Normal,RockDrop,SphereOrbit}` に作成されます。3つは同じマップを使用し、`package-manifest.json` の演出（`scene_mode`）だけが異なります。
 
-生成される `Interchange/SMPL.glb`、`Content/SMPL.uasset`、`Content/SMPL_Skeleton.uasset`、`Deliverables/` はSMPLを含むため、再配布しないでください。
+生成される `Interchange/SMPL.glb`、`Content/SMPL.uasset`、`Content/SMPL_Skeleton.uasset` はSMPLを、`Deliverables/` はSMPLとSocketClientプラグインを含むため、再配布しないでください。
 
 衣装は人体とは別のスケルタルメッシュ（`/Game/Garments/SK_Garments`）です。録画開始時に `ClothMeshCompm` を人体 `SMPLcomp` の姿勢に追従させます。
 
