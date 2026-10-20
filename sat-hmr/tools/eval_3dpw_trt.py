@@ -12,7 +12,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,9 +27,26 @@ from configs.paths import smpl_model_path
 from datasets.pw3d import PW3D
 from models.human_models import SMPL_Layer
 from tools.sat_hmr_export_utils import load_config
+from trt_runner import TensorRTRunner, pick_output, select_confident_queries
 from utils import misc
 from utils.constants import H36M_EVAL_JOINTS
 from utils.evaluation import cal_3d_position_error, compute_prf1, get_matching_dict, match_2d_greedy
+
+
+DETAILS_CSV_COLUMNS = [
+    "image_index",
+    "image_path",
+    "gt_persons",
+    "pred_persons",
+    "misses",
+    "false_positives",
+    "matched",
+    "infer_ms",
+    "mpjpe_mm_mean",
+    "pa_mpjpe_mm_mean",
+    "pve_mm_mean",
+    "pa_pve_mm_mean",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,223 +81,98 @@ def project_joints(j3d: np.ndarray, cam_intrinsics: np.ndarray) -> np.ndarray:
     return proj[..., :2] / z
 
 
-def pick_output(outputs: Dict[str, np.ndarray], name: str) -> np.ndarray:
-    if name not in outputs:
-        raise KeyError(f"Output tensor not found: {name}. got={list(outputs.keys())}")
-    return outputs[name]
+def fit_to_engine_shape(image_np: np.ndarray, expected_shape: Optional[Tuple[int, ...]]) -> np.ndarray:
+    """Zero-pad / crop H and W to the engine's static input shape (3DPW image sizes vary)."""
+    if expected_shape is None or tuple(image_np.shape) == expected_shape:
+        return image_np
+    _, _, eh, ew = expected_shape
+    _, _, ih, iw = image_np.shape
+    if ih == eh and iw == ew:
+        return image_np
+    padded = np.zeros((1, 3, eh, ew), dtype=np.float32)
+    ch = min(ih, eh)
+    cw = min(iw, ew)
+    padded[:, :, :ch, :cw] = image_np[:, :, :ch, :cw]
+    return padded
 
 
-class TensorRTRunner:
-    def __init__(self, engine_path: str):
-        try:
-            import tensorrt as trt  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(
-                "TensorRT Python bindings are not available. "
-                "Install tensorrt in the active environment. "
-                f"(detail: {exc})"
-            )
+def to_h36m_joints(verts: torch.Tensor, transl: torch.Tensor, smpl2h36m: torch.Tensor) -> torch.Tensor:
+    """Regress H36M joints from root-relative vertices, then move them back by transl ([B, 1, 3])."""
+    return torch.einsum("bik,ji->bjk", [verts - transl, smpl2h36m]) + transl
 
-        cuda_import_exc = None
-        try:
-            from cuda import cudart as cuda_rt  # type: ignore
-        except Exception as exc:
-            cuda_import_exc = exc
-            try:
-                from cuda.bindings import runtime as cuda_rt  # type: ignore
-            except Exception:
-                raise RuntimeError(
-                    "CUDA runtime bindings are not available. "
-                    "Install cuda-python in this environment. "
-                    f"(detail: {cuda_import_exc})"
-                )
 
-        self.trt = trt
-        self.cudart = cuda_rt
+def predict_people(
+    outputs: Dict[str, np.ndarray],
+    sel: np.ndarray,
+    smpl_layer: SMPL_Layer,
+    smpl_device: torch.device,
+    smpl2h36m_dev: torch.Tensor,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Returns camera-space (verts [N,6890,3], H36M joints [N,17,3], SMPL joints [N,24,3])."""
+    if len(sel) == 0:
+        return (
+            np.zeros((0, 6890, 3), dtype=np.float32),
+            np.zeros((0, 17, 3), dtype=np.float32),
+            np.zeros((0, 24, 3), dtype=np.float32),
+        )
 
-        logger = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(logger)
-        if hasattr(runtime, "engine_host_code_allowed"):
-            runtime.engine_host_code_allowed = True
+    pred_poses = pick_output(outputs, "pred_poses")[0][sel].astype(np.float32)
+    pred_betas = pick_output(outputs, "pred_betas")[0][sel].astype(np.float32)
+    pred_transl = pick_output(outputs, "pred_transl")[0][sel].astype(np.float32)
 
-        with open(engine_path, "rb") as f:
-            engine_bytes = f.read()
+    with torch.no_grad():
+        poses_t = torch.from_numpy(pred_poses).to(device=smpl_device, non_blocking=True)
+        betas_t = torch.from_numpy(pred_betas).to(device=smpl_device, non_blocking=True)
+        transl_t = torch.from_numpy(pred_transl).to(device=smpl_device, non_blocking=True)
 
-        engine = runtime.deserialize_cuda_engine(engine_bytes)
-        if engine is None:
-            raise RuntimeError(
-                f"Failed to deserialize engine: {engine_path} "
-                f"(TensorRT runtime={self.trt.__version__}). "
-                "The engine was likely built by an incompatible TensorRT version."
-            )
+        verts_t, smpl_joints_t = smpl_layer(poses=poses_t, betas=betas_t)
+        verts_t = verts_t + transl_t.unsqueeze(1)
+        smpl_joints_t = smpl_joints_t + transl_t.unsqueeze(1)
+        j3ds_t = to_h36m_joints(verts_t, transl_t.unsqueeze(1), smpl2h36m_dev)
 
-        context = engine.create_execution_context()
-        if context is None:
-            raise RuntimeError("Failed to create TensorRT execution context")
+    return (
+        verts_t.detach().cpu().numpy(),
+        j3ds_t.detach().cpu().numpy(),
+        smpl_joints_t.detach().cpu().numpy(),
+    )
 
-        self.engine = engine
-        self.context = context
-        self.runtime = runtime
-        self.stream = self._cuda(self.cudart.cudaStreamCreate(), "cudaStreamCreate")
 
-        self.input_names: List[str] = []
-        self.output_names: List[str] = []
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            mode = self.engine.get_tensor_mode(name)
-            if mode == self.trt.TensorIOMode.INPUT:
-                self.input_names.append(name)
-            else:
-                self.output_names.append(name)
+def pelvis_aligned_errors(
+    pred_j3d: np.ndarray, gt_j3d: np.ndarray, pred_verts: np.ndarray, gt_verts: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """Returns (MPJPE, PA-MPJPE, PVE, PA-PVE) after aligning both sides at their pelvis joint."""
+    gt3d = gt_j3d.reshape(-1, 3)
+    pd3d = pred_j3d.reshape(-1, 3)
+    gtv = gt_verts.reshape(-1, 3)
+    pdv = pred_verts.reshape(-1, 3)
 
-        if not self.input_names:
-            raise RuntimeError("Engine has no inputs")
+    gt_pelvis = gt3d[[0], :].copy()
+    pd_pelvis = pd3d[[0], :].copy()
 
-        self.image_input_name = None
-        self.img_size_input_name = None
-        for name in self.input_names:
-            shape = tuple(self.engine.get_tensor_shape(name))
-            dtype = self.engine.get_tensor_dtype(name)
-            if len(shape) == 4 and self.trt.nptype(dtype) == np.float32:
-                self.image_input_name = name
-            elif len(shape) <= 2 and self.trt.nptype(dtype) in (np.int32, np.int64):
-                if "img_size" in name:
-                    self.img_size_input_name = name
+    gt3d = (gt3d - gt_pelvis)[H36M_EVAL_JOINTS, :].copy()
+    pd3d = (pd3d - pd_pelvis)[H36M_EVAL_JOINTS, :].copy()
+    gtv = (gtv - gt_pelvis).copy()
+    pdv = (pdv - pd_pelvis).copy()
 
-        if self.image_input_name is None:
-            self.image_input_name = self.input_names[0]
+    e_j, pa_e_j = cal_3d_position_error(pd3d, gt3d)
+    e_v, pa_e_v = cal_3d_position_error(pdv, gtv)
+    return float(e_j), float(pa_e_j), float(e_v), float(pa_e_v)
 
-        if self.img_size_input_name is None:
-            for name in self.input_names:
-                if name != self.image_input_name:
-                    self.img_size_input_name = name
-                    break
 
-        self.device_ptrs: Dict[str, int] = {}
-        self.output_host: Dict[str, np.ndarray] = {}
-        self.allocated_shapes: Dict[str, Tuple[int, ...]] = {}
+def safe_mean(vals: List[float]) -> float:
+    if not vals:
+        return float("nan")
+    return float(np.mean(vals))
 
-    def _cuda(self, ret, op_name: str):
-        if isinstance(ret, tuple):
-            status = int(ret[0])
-            values = ret[1:]
-        else:
-            status = int(ret)
-            values = ()
-        if status != 0:
-            hint = ""
-            if status == 35:
-                hint = (
-                    " | cudaErrorInsufficientDriver: CUDA runtime and NVIDIA driver are incompatible. "
-                    "If cuda-python 13.x is installed on a CUDA 12.x driver, downgrade cuda-python to 12.x."
-                )
-            raise RuntimeError(f"{op_name} failed (cudaError={status}){hint}")
-        if len(values) == 0:
-            return None
-        if len(values) == 1:
-            return values[0]
-        return values
 
-    def _free_buffers(self):
-        for ptr in self.device_ptrs.values():
-            try:
-                self._cuda(self.cudart.cudaFree(ptr), "cudaFree")
-            except Exception:
-                pass
-        self.device_ptrs.clear()
-        self.output_host.clear()
-        self.allocated_shapes.clear()
+def safe_p95(vals: List[float]) -> float:
+    if not vals:
+        return float("nan")
+    return float(np.percentile(vals, 95))
 
-    def _ensure_allocated(self, inputs: Dict[str, np.ndarray]):
-        for name in self.input_names:
-            arr = inputs[name]
-            self.context.set_input_shape(name, tuple(arr.shape))
 
-        needs_alloc = False
-        current_shapes: Dict[str, Tuple[int, ...]] = {}
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            shape = tuple(int(x) for x in self.context.get_tensor_shape(name))
-            if any(x < 0 for x in shape):
-                raise RuntimeError(f"Unresolved dynamic shape for tensor: {name} -> {shape}")
-            current_shapes[name] = shape
-            if self.allocated_shapes.get(name) != shape:
-                needs_alloc = True
-
-        if not needs_alloc and len(self.device_ptrs) == self.engine.num_io_tensors:
-            return
-
-        self._free_buffers()
-        for i in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(i)
-            dtype = self.trt.nptype(self.engine.get_tensor_dtype(name))
-            shape = current_shapes[name]
-            nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
-            ptr = self._cuda(self.cudart.cudaMalloc(nbytes), f"cudaMalloc({name})")
-            self.device_ptrs[name] = int(ptr)
-            self.context.set_tensor_address(name, int(ptr))
-            self.allocated_shapes[name] = shape
-
-            if self.engine.get_tensor_mode(name) == self.trt.TensorIOMode.OUTPUT:
-                self.output_host[name] = np.empty(shape, dtype=dtype)
-
-    def infer(self, inputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        for name in self.input_names:
-            if name not in inputs:
-                raise KeyError(f"Missing input tensor: {name}")
-            arr = np.ascontiguousarray(inputs[name])
-            expected_dtype = self.trt.nptype(self.engine.get_tensor_dtype(name))
-            if arr.dtype != expected_dtype:
-                arr = arr.astype(expected_dtype, copy=False)
-            inputs[name] = arr
-
-        self._ensure_allocated(inputs)
-
-        for name in self.input_names:
-            arr = inputs[name]
-            self._cuda(
-                self.cudart.cudaMemcpyAsync(
-                    self.device_ptrs[name],
-                    arr.ctypes.data,
-                    arr.nbytes,
-                    self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-                    self.stream,
-                ),
-                f"cudaMemcpyAsync H2D ({name})",
-            )
-
-        ok = self.context.execute_async_v3(stream_handle=self.stream)
-        if not ok:
-            raise RuntimeError("TensorRT execution failed (execute_async_v3 returned False)")
-
-        for name in self.output_names:
-            out = self.output_host[name]
-            self._cuda(
-                self.cudart.cudaMemcpyAsync(
-                    out.ctypes.data,
-                    self.device_ptrs[name],
-                    out.nbytes,
-                    self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-                    self.stream,
-                ),
-                f"cudaMemcpyAsync D2H ({name})",
-            )
-
-        self._cuda(self.cudart.cudaStreamSynchronize(self.stream), "cudaStreamSynchronize")
-        return {k: v.copy() for k, v in self.output_host.items()}
-
-    def get_engine_image_shape(self):
-        shape = tuple(self.engine.get_tensor_shape(self.image_input_name))
-        if len(shape) == 4 and shape[0] > 0 and shape[2] > 0 and shape[3] > 0:
-            return tuple(int(v) for v in shape)
-        return None
-
-    def close(self):
-        self._free_buffers()
-        try:
-            self._cuda(self.cudart.cudaStreamDestroy(self.stream), "cudaStreamDestroy")
-        except Exception:
-            pass
+def rounded_mean_or_blank(vals: List[float]):
+    return round(float(np.mean(vals)), 4) if vals else ""
 
 
 def evaluate(args: argparse.Namespace) -> Dict[str, float]:
@@ -331,20 +223,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
         ensure_parent(args.details_csv)
         details_fp = open(args.details_csv, "w", newline="", encoding="utf-8")
         details_writer = csv.writer(details_fp)
-        details_writer.writerow([
-            "image_index",
-            "image_path",
-            "gt_persons",
-            "pred_persons",
-            "misses",
-            "false_positives",
-            "matched",
-            "infer_ms",
-            "mpjpe_mm_mean",
-            "pa_mpjpe_mm_mean",
-            "pve_mm_mean",
-            "pa_pve_mm_mean",
-        ])
+        details_writer.writerow(DETAILS_CSV_COLUMNS)
 
     start_t = time.perf_counter()
     processed_images = 0
@@ -356,16 +235,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
                 break
 
             image_np = np.ascontiguousarray(sample.unsqueeze(0).numpy().astype(np.float32))
-            if expected_shape is not None and tuple(image_np.shape) != expected_shape:
-                # Pad or crop spatial dims to match engine static shape
-                _, _, eh, ew = expected_shape
-                _, _, ih, iw = image_np.shape
-                if ih != eh or iw != ew:
-                    padded = np.zeros((1, 3, eh, ew), dtype=np.float32)
-                    ch = min(ih, eh)
-                    cw = min(iw, ew)
-                    padded[:, :, :ch, :cw] = image_np[:, :, :ch, :cw]
-                    image_np = padded
+            image_np = fit_to_engine_shape(image_np, expected_shape)
 
             trt_inputs = {runner.image_input_name: image_np}
             if runner.img_size_input_name is not None:
@@ -376,34 +246,10 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
             infer_ms = (time.perf_counter() - t0) * 1000.0
             infer_ms_list.append(infer_ms)
 
-            confs = pick_output(outputs, "pred_confs")[0].reshape(-1)
-            sel = np.where(confs > args.conf_thresh)[0]
-
-            if len(sel) > 0:
-                pred_poses = pick_output(outputs, "pred_poses")[0][sel].astype(np.float32)
-                pred_betas = pick_output(outputs, "pred_betas")[0][sel].astype(np.float32)
-                pred_transl = pick_output(outputs, "pred_transl")[0][sel].astype(np.float32)
-
-                with torch.no_grad():
-                    poses_t = torch.from_numpy(pred_poses).to(device=smpl_device, non_blocking=True)
-                    betas_t = torch.from_numpy(pred_betas).to(device=smpl_device, non_blocking=True)
-                    transl_t = torch.from_numpy(pred_transl).to(device=smpl_device, non_blocking=True)
-
-                    verts_t, smpl_joints_t = smpl_layer(poses=poses_t, betas=betas_t)
-                    verts_t = verts_t + transl_t.unsqueeze(1)
-                    smpl_joints_t = smpl_joints_t + transl_t.unsqueeze(1)
-                    j3ds_t = (
-                        torch.einsum("bik,ji->bjk", [verts_t - transl_t.unsqueeze(1), smpl2h36m_dev])
-                        + transl_t.unsqueeze(1)
-                    )
-
-                pred_verts = verts_t.detach().cpu().numpy()
-                pred_j3ds = j3ds_t.detach().cpu().numpy()
-                pred_smpl_j3ds = smpl_joints_t.detach().cpu().numpy()
-            else:
-                pred_verts = np.zeros((0, 6890, 3), dtype=np.float32)
-                pred_j3ds = np.zeros((0, 17, 3), dtype=np.float32)
-                pred_smpl_j3ds = np.zeros((0, 24, 3), dtype=np.float32)
+            _confs, sel = select_confident_queries(outputs, args.conf_thresh)
+            pred_verts, pred_j3ds, pred_smpl_j3ds = predict_people(
+                outputs, sel, smpl_layer, smpl_device, smpl2h36m_dev
+            )
 
             cam_intrinsics = target["cam_intrinsics"]
             if cam_intrinsics.ndim == 3:
@@ -414,10 +260,7 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
 
             gt_verts_t = target["verts"].cpu()
             gt_transl_t = target["transl"].cpu()
-            gt_j3ds_t = (
-                torch.einsum("bik,ji->bjk", [gt_verts_t - gt_transl_t[:, None, :], smpl2h36m_cpu])
-                + gt_transl_t[:, None, :]
-            )
+            gt_j3ds_t = to_h36m_joints(gt_verts_t, gt_transl_t[:, None, :], smpl2h36m_cpu)
             gt_verts = gt_verts_t.numpy()
             gt_j3ds = gt_j3ds_t.numpy()
             gt_j2ds = target["j2ds"].cpu().numpy()[:, :24, :]
@@ -442,31 +285,19 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
                 pred_idx = int(pred_idx)
                 matched += 1
 
-                gt3d = gt_j3ds[gt_idx].reshape(-1, 3)
-                pd3d = pred_j3ds[pred_idx].reshape(-1, 3)
-                gtv = gt_verts[gt_idx].reshape(-1, 3)
-                pdv = pred_verts[pred_idx].reshape(-1, 3)
+                e_j, pa_e_j, e_v, pa_e_v = pelvis_aligned_errors(
+                    pred_j3ds[pred_idx], gt_j3ds[gt_idx], pred_verts[pred_idx], gt_verts[gt_idx]
+                )
 
-                gt_pelvis = gt3d[[0], :].copy()
-                pd_pelvis = pd3d[[0], :].copy()
+                sample_mpjpe.append(e_j)
+                sample_pa_mpjpe.append(pa_e_j)
+                sample_pve.append(e_v)
+                sample_pa_pve.append(pa_e_v)
 
-                gt3d = (gt3d - gt_pelvis)[H36M_EVAL_JOINTS, :].copy()
-                pd3d = (pd3d - pd_pelvis)[H36M_EVAL_JOINTS, :].copy()
-                gtv = (gtv - gt_pelvis).copy()
-                pdv = (pdv - pd_pelvis).copy()
-
-                e_j, pa_e_j = cal_3d_position_error(pd3d, gt3d)
-                e_v, pa_e_v = cal_3d_position_error(pdv, gtv)
-
-                sample_mpjpe.append(float(e_j))
-                sample_pa_mpjpe.append(float(pa_e_j))
-                sample_pve.append(float(e_v))
-                sample_pa_pve.append(float(pa_e_v))
-
-                mpjpe_vals.append(float(e_j))
-                pa_mpjpe_vals.append(float(pa_e_j))
-                pve_vals.append(float(e_v))
-                pa_pve_vals.append(float(pa_e_v))
+                mpjpe_vals.append(e_j)
+                pa_mpjpe_vals.append(pa_e_j)
+                pve_vals.append(e_v)
+                pa_pve_vals.append(pa_e_v)
 
             total_count += gt_count
             total_miss += misses
@@ -482,10 +313,10 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
                     int(false_positive_count),
                     matched,
                     round(infer_ms, 4),
-                    round(float(np.mean(sample_mpjpe)), 4) if sample_mpjpe else "",
-                    round(float(np.mean(sample_pa_mpjpe)), 4) if sample_pa_mpjpe else "",
-                    round(float(np.mean(sample_pve)), 4) if sample_pve else "",
-                    round(float(np.mean(sample_pa_pve)), 4) if sample_pa_pve else "",
+                    rounded_mean_or_blank(sample_mpjpe),
+                    rounded_mean_or_blank(sample_pa_mpjpe),
+                    rounded_mean_or_blank(sample_pve),
+                    rounded_mean_or_blank(sample_pa_pve),
                 ])
 
             processed_images += 1
@@ -498,16 +329,6 @@ def evaluate(args: argparse.Namespace) -> Dict[str, float]:
     total_sec = time.perf_counter() - start_t
 
     precision, recall, f1 = compute_prf1(total_count, total_miss, total_fp)
-
-    def safe_mean(vals: List[float]) -> float:
-        if not vals:
-            return float("nan")
-        return float(np.mean(vals))
-
-    def safe_p95(vals: List[float]) -> float:
-        if not vals:
-            return float("nan")
-        return float(np.percentile(vals, 95))
 
     summary = {
         "backend": "tensorrt",

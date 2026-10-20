@@ -7,7 +7,6 @@ SAT-HMR Video Demo (TensorRT)
 import argparse
 import csv
 import os
-import socket
 import sys
 import time
 from typing import Dict, Optional
@@ -18,16 +17,42 @@ import torch
 
 from configs.paths import smpl_model_path
 from models.human_models import SMPL_Layer
-from utils.transforms import unNormalize
 from sathmr_common import (
+    UdpPoseStreamer,
+    add_udp_args,
     build_cam_intrinsics_from_img_size,
-    preprocess_frame,
-    select_udp_target,
+    empty_udp_candidates,
+    make_udp_candidates,
     setup_render_imports,
-    smpl_pose_to_ue_quaternions,
-    transl_to_ue,
 )
-from trt_runner import TensorRTRunner
+from trt_runner import (
+    TensorRTRunner,
+    draw_rec_marker,
+    draw_timing_overlay,
+    format_timing_status,
+    infer_frame,
+    normalize_demo_args,
+    open_runner_or_exit,
+    pick_output,
+    print_demo_settings,
+    render_mesh_frame,
+    select_confident_queries,
+    update_fps_window,
+)
+
+
+METRICS_CSV_COLUMNS = [
+    'frame',
+    'persons',
+    'preprocess_ms',
+    'inference_ms',
+    'postprocess_ms',
+    'render_ms',
+    'total_ms',
+    'fps_inst',
+    'fps_avg_30',
+    'udp_enabled',
+]
 
 
 def get_args():
@@ -48,24 +73,48 @@ def get_args():
     parser.add_argument('--pred_npz', default=None, help='Per-frame prediction NPZ output path (for pseudo-GT comparison)')
     parser.add_argument('--udp_only', action='store_true', help='UE send only mode (no render, no display)')
 
-    parser.add_argument('--udp', action='store_true', help='Enable UDP send to UE')
-    parser.add_argument('--ue_port', type=int, default=62004, help='UE receive port')
-    parser.add_argument('--local_port', type=int, default=5555, help='Local bind port for HELLO')
-
-    parser.add_argument('--udp_track_max_dist_cm', type=float, default=120.0)
-    parser.add_argument('--udp_reinit_conf', type=float, default=0.55)
-    parser.add_argument('--udp_hold_frames', type=int, default=10)
-    parser.add_argument('--udp_trans_jump_cm', type=float, default=30.0)
-    parser.add_argument('--udp_outlier_mode', choices=['skip', 'clamp'], default='skip')
-    parser.add_argument('--udp_outlier_max_skip', type=int, default=12)
-    parser.add_argument('--udp_jump_conf_thresh', type=float, default=0.35)
-    parser.add_argument('--udp_jump_motion_cm', type=float, default=20.0)
-    parser.add_argument('--udp_jump_pose_motion', type=float, default=0.02)
-    parser.add_argument('--udp_jump_debounce', type=int, default=2)
-    parser.add_argument('--udp_jump_hold_frames', type=int, default=4)
-    parser.add_argument('--udp_jump_cooldown', type=int, default=6)
+    add_udp_args(parser)
 
     return parser.parse_args()
+
+
+def empty_pred_record():
+    return {
+        'joints2d': np.zeros((0, 24, 2), dtype=np.float32),
+        'joints3d': np.zeros((0, 24, 3), dtype=np.float32),
+        'verts': np.zeros((0, 0, 3), dtype=np.float32),
+        'transl': np.zeros((0, 3), dtype=np.float32),
+        'bboxes': np.zeros((0, 4), dtype=np.float32),
+        'focal_length': np.zeros((0,), dtype=np.float32),
+    }
+
+
+def reconstruct_smpl_in_camera(
+    smpl_layer: SMPL_Layer,
+    smpl_device: Optional[torch.device],
+    poses: np.ndarray,
+    betas: np.ndarray,
+    transl: np.ndarray,
+    cam_intrinsics: np.ndarray,
+):
+    """Returns float32 camera-space (verts, 24 joints 3D, their 2D projection)."""
+    if smpl_device is None:
+        smpl_device = torch.device('cpu')
+    with torch.no_grad():
+        poses_t = torch.from_numpy(poses).to(device=smpl_device, non_blocking=True)
+        betas_t = torch.from_numpy(betas).to(device=smpl_device, non_blocking=True)
+        verts, joints = smpl_layer(poses=poses_t, betas=betas_t)
+        trans_t = torch.from_numpy(transl).to(device=smpl_device, non_blocking=True).unsqueeze(1)
+        verts_cam = verts + trans_t
+        joints_cam = joints + trans_t
+        verts_np = verts_cam.cpu().numpy().astype(np.float32)
+        joints3d = joints_cam[:, :24, :].cpu().numpy().astype(np.float32)
+
+    joints2d = np.zeros((len(poses), 24, 2), dtype=np.float32)
+    z = np.clip(joints3d[..., 2:3], 1e-6, None)
+    joints2d[..., 0] = joints3d[..., 0] * cam_intrinsics[0, 0] / z[..., 0] + cam_intrinsics[0, 2]
+    joints2d[..., 1] = joints3d[..., 1] * cam_intrinsics[1, 1] / z[..., 0] + cam_intrinsics[1, 2]
+    return verts_np, joints3d, joints2d
 
 
 def process_frame_trt(
@@ -79,104 +128,34 @@ def process_frame_trt(
     render_utils: Optional[Dict[str, object]],
 ):
     times: Dict[str, float] = {}
+    img_tensor, img_size, orig_size, outputs = infer_frame(runner, frame, input_size, times)
 
     t0 = time.time()
-    img_tensor, img_size, orig_size = preprocess_frame(frame, input_size, use_sat=True)
-    image_np = np.ascontiguousarray(img_tensor.unsqueeze(0).numpy().astype(np.float32))
-    times['preprocess'] = time.time() - t0
-
-    expected = runner.get_engine_image_shape()
-    if expected is not None and tuple(image_np.shape) != expected:
-        raise RuntimeError(
-            'Preprocess output shape does not match engine static input shape: '
-            f'{tuple(image_np.shape)} vs {expected}. '
-            'Use camera resolution/aspect that yields the engine shape.'
-        )
-
-    trt_inputs = {runner.image_input_name: image_np}
-    if runner.img_size_input_name is not None:
-        trt_inputs[runner.img_size_input_name] = np.asarray(img_size, dtype=np.int64)
-
-    t0 = time.time()
-    outputs = runner.infer(trt_inputs)
-    times['inference'] = time.time() - t0
-
-    def pick(name: str) -> np.ndarray:
-        if name not in outputs:
-            raise KeyError(f'Output tensor not found: {name}. got={list(outputs.keys())}')
-        return outputs[name]
-
-    t0 = time.time()
-    pred_confs = pick('pred_confs')
-    confs = pred_confs[0].reshape(-1)
-    select_idx = np.where(confs > conf_thresh)[0]
+    confs, select_idx = select_confident_queries(outputs, conf_thresh)
     num_persons = int(select_idx.size)
 
-    udp_candidates = {
-        'poses': np.empty((0, 72), dtype=np.float32),
-        'transls': np.empty((0, 3), dtype=np.float32),
-        'confs': np.empty((0,), dtype=np.float32),
-        'query_ids': np.empty((0,), dtype=np.int32),
-    }
-    pred_record = {
-        'joints2d': np.zeros((0, 24, 2), dtype=np.float32),
-        'joints3d': np.zeros((0, 24, 3), dtype=np.float32),
-        'verts': np.zeros((0, 0, 3), dtype=np.float32),
-        'transl': np.zeros((0, 3), dtype=np.float32),
-        'bboxes': np.zeros((0, 4), dtype=np.float32),
-        'focal_length': np.zeros((0,), dtype=np.float32),
-    }
-
-    pred_poses = np.zeros((0, 72), dtype=np.float32)
-    pred_betas = np.zeros((0, 10), dtype=np.float32)
-    pred_transl = np.zeros((0, 3), dtype=np.float32)
-    pred_verts = np.zeros((0, 0, 3), dtype=np.float32)
-    pred_j3d_24 = np.zeros((0, 24, 3), dtype=np.float32)
-    pred_j2d_24 = np.zeros((0, 24, 2), dtype=np.float32)
-    pred_intrinsics_np = build_cam_intrinsics_from_img_size(img_size, input_size)
     if 'pred_intrinsics' in outputs:
-        pred_intrinsics_np = outputs['pred_intrinsics'][0].reshape(3, 3).astype(np.float32)
+        cam_intrinsics = outputs['pred_intrinsics'][0].reshape(3, 3).astype(np.float32)
+    else:
+        cam_intrinsics = build_cam_intrinsics_from_img_size(img_size, input_size)
 
+    udp_candidates = empty_udp_candidates()
+    pred_record = empty_pred_record()
     if num_persons > 0:
-        pred_poses = pick('pred_poses')[0][select_idx].astype(np.float32)
-        pred_betas = pick('pred_betas')[0][select_idx].astype(np.float32)
-        pred_transl = pick('pred_transl')[0][select_idx].astype(np.float32)
-        pred_boxes = pick('pred_boxes')[0][select_idx].astype(np.float32)
-        conf_t = confs[select_idx].astype(np.float32)
-        qids = select_idx.astype(np.int32)
-        udp_candidates = {
-            'poses': pred_poses,
-            'transls': pred_transl,
-            'confs': conf_t,
-            'query_ids': qids,
-        }
+        pred_poses = pick_output(outputs, 'pred_poses')[0][select_idx].astype(np.float32)
+        pred_betas = pick_output(outputs, 'pred_betas')[0][select_idx].astype(np.float32)
+        pred_transl = pick_output(outputs, 'pred_transl')[0][select_idx].astype(np.float32)
+        pred_boxes = pick_output(outputs, 'pred_boxes')[0][select_idx].astype(np.float32)
+        udp_candidates = make_udp_candidates(pred_poses, pred_transl, confs, select_idx)
 
+        # Without an SMPL layer only the network outputs are recorded.
         if smpl_layer is not None:
-            if smpl_device is None:
-                smpl_device = torch.device('cpu')
-            with torch.no_grad():
-                poses_t = torch.from_numpy(pred_poses).to(device=smpl_device, non_blocking=True)
-                betas_t = torch.from_numpy(pred_betas).to(device=smpl_device, non_blocking=True)
-                verts, joints = smpl_layer(poses=poses_t, betas=betas_t)
-                trans_t = torch.from_numpy(pred_transl).to(device=smpl_device, non_blocking=True).unsqueeze(1)
-                verts_cam = verts + trans_t
-                joints_cam = joints + trans_t
-                pred_verts = verts_cam.cpu().numpy().astype(np.float32)
-                pred_j3d_24 = joints_cam[:, :24, :].cpu().numpy().astype(np.float32)
-                pred_j2d_24 = np.zeros((num_persons, 24, 2), dtype=np.float32)
-
-                z = np.clip(pred_j3d_24[..., 2:3], 1e-6, None)
-                pred_j2d_24[..., 0] = pred_j3d_24[..., 0] * pred_intrinsics_np[0, 0] / z[..., 0] + pred_intrinsics_np[0, 2]
-                pred_j2d_24[..., 1] = pred_j3d_24[..., 1] * pred_intrinsics_np[1, 1] / z[..., 0] + pred_intrinsics_np[1, 2]
-
-        pred_record = {
-            'joints2d': pred_j2d_24,
-            'joints3d': pred_j3d_24,
-            'verts': pred_verts,
-            'transl': pred_transl,
-            'bboxes': pred_boxes,
-            'focal_length': np.full((num_persons,), float(pred_intrinsics_np[0, 0]), dtype=np.float32),
-        }
+            pred_record['verts'], pred_record['joints3d'], pred_record['joints2d'] = reconstruct_smpl_in_camera(
+                smpl_layer, smpl_device, pred_poses, pred_betas, pred_transl, cam_intrinsics
+            )
+        pred_record['transl'] = pred_transl
+        pred_record['bboxes'] = pred_boxes
+        pred_record['focal_length'] = np.full((num_persons,), float(cam_intrinsics[0, 0]), dtype=np.float32)
 
     times['postprocess'] = time.time() - t0
 
@@ -184,52 +163,96 @@ def process_frame_trt(
         return frame, num_persons, times, udp_candidates, pred_record
 
     t0 = time.time()
-    tensor_to_BGR = render_utils['tensor_to_BGR']
-    pad_img = render_utils['pad_img']
-    vis_meshes_img = render_utils['vis_meshes_img']
-    get_colors_rgb = render_utils['get_colors_rgb']
-
-    ori_img = tensor_to_BGR(unNormalize(img_tensor).cpu())
-
-    if num_persons > 0:
-        pred_intrinsics = torch.from_numpy(pred_intrinsics_np)
-        colors = get_colors_rgb(num_persons)
-        result_img = vis_meshes_img(
-            img=ori_img.copy(),
-            verts=pred_verts,
-            smpl_faces=smpl_layer.faces,
-            cam_intrinsics=pred_intrinsics,
-            colors=colors,
-            padding=True,
-        )
-    else:
-        result_img = pad_img(ori_img, max(ori_img.shape[0], ori_img.shape[1]))
-
-    result_img = result_img[:img_size[0], :img_size[1]]
-    result_img = cv2.resize(result_img, (orig_size[1], orig_size[0]))
+    result_img = render_mesh_frame(
+        render_utils,
+        img_tensor,
+        img_size,
+        orig_size,
+        pred_record['verts'] if num_persons > 0 else None,
+        smpl_layer.faces,
+        torch.from_numpy(cam_intrinsics),
+    )
     times['render'] = time.time() - t0
 
     return result_img, num_persons, times, udp_candidates, pred_record
 
 
+class PredictionNpzWriter:
+    """Collects per-frame predictions and saves them in the pseudo-GT comparison NPZ layout."""
+
+    RECORD_KEYS = ('joints2d', 'joints3d', 'verts', 'transl', 'bboxes', 'focal_length')
+
+    def __init__(self, video_path: str):
+        self.video_path = video_path
+        self.frame_ids = []
+        self.image_paths = []
+        self.person_counts = []
+        self.records = {key: [] for key in self.RECORD_KEYS}
+
+    def add(self, frame_id: int, num_persons: int, pred_record: Dict[str, np.ndarray]):
+        self.frame_ids.append(frame_id)
+        self.image_paths.append(f"{self.video_path}#frame_{frame_id:06d}")
+        self.person_counts.append(num_persons)
+        for key in self.RECORD_KEYS:
+            self.records[key].append(pred_record[key])
+
+    def save(self, path: str):
+        pred_dir = os.path.dirname(path)
+        if pred_dir:
+            os.makedirs(pred_dir, exist_ok=True)
+        np.savez_compressed(
+            path,
+            frame_ids=np.asarray(self.frame_ids, dtype=np.int64),
+            image_paths=np.asarray(self.image_paths, dtype=object),
+            person_counts=np.asarray(self.person_counts, dtype=np.int32),
+            **{key: np.asarray(values, dtype=object) for key, values in self.records.items()},
+            failed_frames=np.int32(0),
+        )
+
+
+def open_metrics_csv(path: str):
+    metrics_dir = os.path.dirname(path)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
+    metrics_fp = open(path, 'w', newline='', encoding='utf-8')
+    metrics_writer = csv.writer(metrics_fp)
+    metrics_writer.writerow(METRICS_CSV_COLUMNS)
+    return metrics_fp, metrics_writer
+
+
+def open_video_writer(args, fps: float, width: int, height: int):
+    """Returns a cv2.VideoWriter, or None when saving is disabled or the writer fails to open."""
+    if args.no_save:
+        return None
+    if args.output is None:
+        base, _ = os.path.splitext(args.input)
+        args.output = f'{base}_trt.mp4'
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+    if not writer.isOpened():
+        print('[WARN] VideoWriter の初期化に失敗したため保存を無効化します')
+        return None
+    print(f'出力動画: {args.output}')
+    return writer
+
+
+def print_time_summary(all_times: Dict[str, list]):
+    print('\n--- 処理時間 (平均) ---')
+    total_time_ms = 0.0
+    for k, v in all_times.items():
+        if len(v) > 0:
+            avg_ms = float(np.mean(v) * 1000.0)
+            total_time_ms += avg_ms
+            print(f'  {k}: {avg_ms:.1f} ms')
+    if total_time_ms > 0:
+        print(f'  合計: {total_time_ms:.1f} ms ({1000.0 / total_time_ms:.1f} FPS)')
+
+
 def main():
     args = get_args()
-
-    if args.input_size % 56 != 0:
-        print(f'エラー: input_size ({args.input_size}) は56の倍数である必要があります')
-        sys.exit(1)
-    if args.render_every < 1:
-        print('エラー: render_every は1以上で指定してください')
-        sys.exit(1)
     if args.show:
         args.no_display = False
-    if args.no_display:
-        args.no_render = True
-
-    if args.udp_only:
-        args.no_render = True
-        args.no_display = True
-        args.show_fps = False
+    normalize_demo_args(args)
 
     # Video
     cap = cv2.VideoCapture(args.input)
@@ -247,32 +270,10 @@ def main():
     print(f'入力動画: {args.input}')
     print(f'解像度: {actual_width}x{actual_height}, FPS: {video_fps:.2f}, フレーム数: {total_frames}')
 
-    # Recorder
-    writer = None
-    if not args.no_save:
-        if args.output is None:
-            base, _ = os.path.splitext(args.input)
-            args.output = f'{base}_trt.mp4'
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(args.output, fourcc, video_fps, (actual_width, actual_height))
-        if writer.isOpened():
-            print(f'出力動画: {args.output}')
-        else:
-            writer = None
-            print('[WARN] VideoWriter の初期化に失敗したため保存を無効化します')
+    writer = open_video_writer(args, video_fps, actual_width, actual_height)
 
-    # TensorRT
-    print(f'[INFO] TensorRT engine load: {args.engine}')
-    try:
-        runner = TensorRTRunner(args.engine)
-    except Exception as exc:
-        print(f'[ERROR] TensorRT runner init failed: {exc}')
-        print('ヒント: `pip install tensorrt cuda-python` (環境に合わせて)')
-        sys.exit(1)
+    runner = open_runner_or_exit(args.engine)
 
-    runner.describe()
-
-    # Render setup
     render_ok, render_utils = setup_render_imports(args.no_render)
     if not render_ok:
         args.no_render = True
@@ -287,35 +288,7 @@ def main():
         smpl_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         smpl_layer = SMPL_Layer(model_path=smpl_model_path, with_genders=False).to(smpl_device).eval()
 
-    print(f'Engine: {args.engine}')
-    print(f'信頼度閾値: {args.conf_thresh}')
-    print(f'入力サイズ: {args.input_size}')
-    if args.udp_only:
-        print('UDP専用モード: ON (描画/表示を無効化)')
-    if args.no_render:
-        print('メッシュ描画: OFF')
-    elif args.render_every > 1:
-        print(f'メッシュ描画間隔: {args.render_every}フレーム毎')
-    if args.udp and not args.no_render:
-        print('[WARN] 描画ONだとrender処理が重く、FPSが低下します。実運用は --udp_only または --no_render を推奨')
-
-    if args.udp:
-        print(f'UDP送信: ON (local:{args.local_port} -> ue:{args.ue_port})')
-        if args.udp_trans_jump_cm > 0:
-            print(
-                f'外れ値抑制: ON (mode={args.udp_outlier_mode}, '
-                f'trans_jump_cm={args.udp_trans_jump_cm:.1f}, max_skip={args.udp_outlier_max_skip})'
-            )
-        else:
-            print('外れ値抑制: OFF')
-        print(
-            'ジャンプ例外: '
-            f'conf>={args.udp_jump_conf_thresh:.2f}, '
-            f'motion>={args.udp_jump_motion_cm:.1f}cm or '
-            f'pose>={args.udp_jump_pose_motion:.4f}, '
-            f'debounce={args.udp_jump_debounce}, '
-            f'hold={args.udp_jump_hold_frames}, cooldown={args.udp_jump_cooldown}'
-        )
+    print_demo_settings(args)
 
     print('\n=== 操作方法 ===')
     if not args.no_display:
@@ -326,65 +299,18 @@ def main():
 
     frame_count = 0
     fps_queue = []
-    recording = writer is not None
     total_persons = 0
     all_times = {'preprocess': [], 'inference': [], 'postprocess': [], 'render': []}
-    pred_frame_ids = []
-    pred_image_paths = []
-    pred_person_counts = []
-    pred_joints2d = []
-    pred_joints3d = []
-    pred_verts = []
-    pred_transl = []
-    pred_bboxes = []
-    pred_focal_length = []
+    npz_writer = PredictionNpzWriter(args.input) if args.pred_npz else None
     metrics_fp = None
     metrics_writer = None
     if args.metrics_csv:
-        metrics_dir = os.path.dirname(args.metrics_csv)
-        if metrics_dir:
-            os.makedirs(metrics_dir, exist_ok=True)
-        metrics_fp = open(args.metrics_csv, 'w', newline='', encoding='utf-8')
-        metrics_writer = csv.writer(metrics_fp)
-        metrics_writer.writerow([
-            'frame',
-            'persons',
-            'preprocess_ms',
-            'inference_ms',
-            'postprocess_ms',
-            'render_ms',
-            'total_ms',
-            'fps_inst',
-            'fps_avg_30',
-            'udp_enabled',
-        ])
+        metrics_fp, metrics_writer = open_metrics_csv(args.metrics_csv)
 
-    sock = None
-    ue_host = None
-    first_send_done = False
-    time_connection_success = None
-    prev_quat = None
-    prev_trans = None
-    outlier_skip_streak = 0
-    jump_candidate_streak = 0
-    jump_hold_left = 0
-    jump_cooldown_left = 0
-    tracker_state = {
-        'active': False,
-        'transl': None,
-        'query_id': None,
-        'missed': 0,
-    }
-
+    udp = None
     if args.udp:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(('0.0.0.0', args.local_port))
-        print(f'[WAIT] HELLO on 0.0.0.0:{args.local_port}')
-        _, addr = sock.recvfrom(2048)
-        ue_host = addr[0]
-        print(f'[HELLO] from {addr} -> dst={(ue_host, args.ue_port)}')
-        time_connection_success = time.perf_counter()
+        udp = UdpPoseStreamer(args)
+        udp.wait_for_hello()
 
     try:
         while True:
@@ -394,11 +320,6 @@ def main():
                 break
 
             start_time = time.time()
-            if jump_cooldown_left > 0:
-                jump_cooldown_left -= 1
-            if jump_hold_left > 0:
-                jump_hold_left -= 1
-
             render_this_frame = (not args.no_render) and (frame_count % args.render_every == 0)
 
             result_frame, num_persons, times, udp_candidates, pred_record = process_frame_trt(
@@ -412,147 +333,17 @@ def main():
                 render_utils=render_utils,
             )
             total_persons += num_persons
-            if args.pred_npz:
-                pred_frame_ids.append(frame_count)
-                pred_image_paths.append(f"{args.input}#frame_{frame_count:06d}")
-                pred_person_counts.append(num_persons)
-                pred_joints2d.append(pred_record['joints2d'])
-                pred_joints3d.append(pred_record['joints3d'])
-                pred_verts.append(pred_record['verts'])
-                pred_transl.append(pred_record['transl'])
-                pred_bboxes.append(pred_record['bboxes'])
-                pred_focal_length.append(pred_record['focal_length'])
+            if npz_writer is not None:
+                npz_writer.add(frame_count, num_persons, pred_record)
             for k, v in times.items():
                 if k in all_times:
                     all_times[k].append(v)
 
-            if args.udp:
-                udp_data, tracker_state, track_reason = select_udp_target(
-                    udp_candidates,
-                    tracker_state,
-                    args.udp_track_max_dist_cm,
-                    args.udp_reinit_conf,
-                )
-
-                if udp_data is None:
-                    outlier_skip_streak = 0
-                    jump_candidate_streak = 0
-                    tracker_state['missed'] += 1
-                    if tracker_state['missed'] > args.udp_hold_frames:
-                        tracker_state['active'] = False
-                        tracker_state['transl'] = None
-                        tracker_state['query_id'] = None
-                    if frame_count % 30 == 0:
-                        print(f'UDP frame={frame_count} skip ({track_reason}) persons={num_persons}')
-                else:
-                    quaternions = smpl_pose_to_ue_quaternions(udp_data['pose'])
-                    trans = transl_to_ue(udp_data['transl'])
-
-                    if np.isfinite(quaternions).all() and np.isfinite(trans).all():
-                        raw_trans_motion = 0.0 if prev_trans is None else float(np.linalg.norm(trans - prev_trans))
-                        raw_pose_motion = 0.0 if prev_quat is None else float(np.mean(np.abs(quaternions - prev_quat)))
-
-                        outlier_note = ''
-                        send_trans = trans.copy()
-                        skip_send = False
-
-                        jump_armed = False
-                        if prev_trans is not None and jump_cooldown_left == 0:
-                            jump_cond = (
-                                udp_data['conf'] >= args.udp_jump_conf_thresh and
-                                (
-                                    raw_trans_motion >= args.udp_jump_motion_cm or
-                                    raw_pose_motion >= args.udp_jump_pose_motion
-                                )
-                            )
-                            if jump_cond:
-                                jump_candidate_streak += 1
-                                if jump_candidate_streak >= max(1, args.udp_jump_debounce):
-                                    jump_hold_left = max(jump_hold_left, args.udp_jump_hold_frames)
-                                    jump_candidate_streak = 0
-                            else:
-                                jump_candidate_streak = 0
-                        else:
-                            jump_candidate_streak = 0
-
-                        if jump_hold_left > 0:
-                            jump_armed = True
-                            outlier_skip_streak = 0
-                            outlier_note = f' jump_bypass(hold={jump_hold_left})'
-
-                        if (not jump_armed) and prev_trans is not None and args.udp_trans_jump_cm > 0 and raw_trans_motion > args.udp_trans_jump_cm:
-                            if args.udp_outlier_mode == 'skip':
-                                outlier_skip_streak += 1
-                                if outlier_skip_streak <= args.udp_outlier_max_skip:
-                                    skip_send = True
-                                    outlier_note = (
-                                        f'trans_outlier {raw_trans_motion:.2f}>{args.udp_trans_jump_cm:.2f}cm '
-                                        f'(skip {outlier_skip_streak}/{args.udp_outlier_max_skip})'
-                                    )
-                                else:
-                                    outlier_note = (
-                                        f' outlier=rebase({raw_trans_motion:.2f}cm '
-                                        f'after {outlier_skip_streak} skips)'
-                                    )
-                                    outlier_skip_streak = 0
-                            else:
-                                delta = trans - prev_trans
-                                scale = args.udp_trans_jump_cm / (raw_trans_motion + 1e-9)
-                                send_trans = prev_trans + delta * scale
-                                outlier_note = (
-                                    f' outlier=clamp({raw_trans_motion:.2f}'
-                                    f'->{args.udp_trans_jump_cm:.2f}cm)'
-                                )
-                                outlier_skip_streak = 0
-                        else:
-                            outlier_skip_streak = 0
-
-                        if skip_send:
-                            if frame_count % 30 == 0:
-                                print(
-                                    f'UDP frame={frame_count} skip ({outlier_note}) persons={num_persons}'
-                                )
-                        else:
-                            pose_str = ','.join(f'{v:.4f}' for v in quaternions.flatten())
-                            trans_str = ','.join(f'{v:.4f}' for v in send_trans.flatten())
-                            payload = f'{pose_str}|{trans_str}\n'.encode('ascii')
-                            sent = sock.sendto(payload, (ue_host, args.ue_port))
-
-                            if not first_send_done:
-                                startup_lag = time.perf_counter() - time_connection_success
-                                print(f'[INFO] Startup Lag: {startup_lag:.4f} seconds')
-                                first_send_done = True
-
-                            if prev_quat is None:
-                                pose_motion = 0.0
-                                trans_motion = 0.0
-                            else:
-                                pose_motion = raw_pose_motion
-                                trans_motion = float(np.linalg.norm(send_trans - prev_trans))
-
-                            prev_quat = quaternions.copy()
-                            prev_trans = send_trans.copy()
-
-                            if jump_armed and jump_hold_left == 1:
-                                jump_cooldown_left = max(0, args.udp_jump_cooldown)
-
-                            if frame_count % 30 == 0:
-                                print(
-                                    f'UDP frame={frame_count} conf={udp_data["conf"]:.3f} '
-                                    f'persons={udp_data["num_persons"]} query={udp_data["query_id"]} '
-                                    f'reason={track_reason} pose_motion={pose_motion:.5f} '
-                                    f'trans_motion={trans_motion:.2f}{outlier_note} sent={sent}'
-                                )
-                    else:
-                        if frame_count % 30 == 0:
-                            print(f'UDP frame={frame_count} skip (invalid payload) persons={num_persons}')
+            if udp is not None:
+                udp.process(frame_count, num_persons, udp_candidates)
 
             elapsed = time.time() - start_time
-            current_fps = 1.0 / elapsed if elapsed > 0 else 0
-            fps_queue.append(current_fps)
-            if len(fps_queue) > 30:
-                fps_queue.pop(0)
-            avg_fps = float(np.mean(fps_queue)) if fps_queue else 0.0
+            current_fps, avg_fps = update_fps_window(fps_queue, elapsed)
             if metrics_writer is not None:
                 metrics_writer.writerow([
                     frame_count,
@@ -570,39 +361,17 @@ def main():
                     metrics_fp.flush()
 
             if args.show_fps and not args.no_display:
-                cv2.putText(result_frame, f'FPS: {current_fps:.1f}', (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(result_frame, f'Persons: {num_persons}', (10, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                y_offset = 110
-                cv2.putText(result_frame, f"Preprocess: {times['preprocess']*1000:.1f}ms", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                y_offset += 30
-                cv2.putText(result_frame, f"Inference: {times['inference']*1000:.1f}ms", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                y_offset += 30
-                cv2.putText(result_frame, f"Postprocess: {times['postprocess']*1000:.1f}ms", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                if 'render' in times:
-                    y_offset += 30
-                    cv2.putText(result_frame, f"Render: {times['render']*1000:.1f}ms", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                draw_timing_overlay(result_frame, current_fps, num_persons, times)
 
-            if recording and writer is not None:
-                cv2.circle(result_frame, (actual_width - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(result_frame, 'REC', (actual_width - 80, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if writer is not None:
+                draw_rec_marker(result_frame, actual_width)
                 writer.write(result_frame)
 
             if args.no_display:
                 if frame_count % 30 == 0:
-                    render_ms = f"{times['render']*1000:.0f}ms" if 'render' in times else 'skip'
                     print(
                         f"Frame: {frame_count}/{total_frames} | FPS: {current_fps:.1f} | Persons: {num_persons} | "
-                        f"Preprocess: {times['preprocess']*1000:.0f}ms | "
-                        f"Inference: {times['inference']*1000:.0f}ms | "
-                        f"Postprocess: {times['postprocess']*1000:.0f}ms | "
-                        f"Render: {render_ms}"
+                        f"{format_timing_status(times)}"
                     )
             else:
                 cv2.imshow('SAT-HMR Video Demo (TensorRT)', result_frame)
@@ -621,8 +390,8 @@ def main():
         cap.release()
         if writer is not None:
             writer.release()
-        if sock is not None:
-            sock.close()
+        if udp is not None:
+            udp.close()
         if metrics_fp is not None:
             metrics_fp.close()
         runner.close()
@@ -631,36 +400,13 @@ def main():
     print('\n処理完了!')
     print(f'処理フレーム数: {frame_count}')
     print(f'平均検出人数: {total_persons / max(frame_count, 1):.2f}')
-    print('\n--- 処理時間 (平均) ---')
-    total_time_ms = 0.0
-    for k, v in all_times.items():
-        if len(v) > 0:
-            avg_ms = float(np.mean(v) * 1000.0)
-            total_time_ms += avg_ms
-            print(f'  {k}: {avg_ms:.1f} ms')
-    if total_time_ms > 0:
-        print(f'  合計: {total_time_ms:.1f} ms ({1000.0 / total_time_ms:.1f} FPS)')
+    print_time_summary(all_times)
     if writer is not None and args.output:
         print(f'出力動画: {args.output}')
     if args.metrics_csv:
         print(f'測定CSV: {args.metrics_csv}')
-    if args.pred_npz:
-        pred_dir = os.path.dirname(args.pred_npz)
-        if pred_dir:
-            os.makedirs(pred_dir, exist_ok=True)
-        np.savez_compressed(
-            args.pred_npz,
-            frame_ids=np.asarray(pred_frame_ids, dtype=np.int64),
-            image_paths=np.asarray(pred_image_paths, dtype=object),
-            person_counts=np.asarray(pred_person_counts, dtype=np.int32),
-            joints2d=np.asarray(pred_joints2d, dtype=object),
-            joints3d=np.asarray(pred_joints3d, dtype=object),
-            verts=np.asarray(pred_verts, dtype=object),
-            transl=np.asarray(pred_transl, dtype=object),
-            bboxes=np.asarray(pred_bboxes, dtype=object),
-            focal_length=np.asarray(pred_focal_length, dtype=object),
-            failed_frames=np.int32(0),
-        )
+    if npz_writer is not None:
+        npz_writer.save(args.pred_npz)
         print(f'予測NPZ: {args.pred_npz}')
 
 

@@ -23,13 +23,9 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import sys
 
 import torch
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 def quantize_state_dict(state_dict: dict) -> tuple[dict, dict]:
     """Quantize all 2D Linear weights in state_dict to INT8 (per output channel).
@@ -60,26 +56,19 @@ def quantize_state_dict(state_dict: dict) -> tuple[dict, dict]:
 
 
 def dequantize_state_dict(quant_dict: dict) -> dict:
-    """Dequantize INT8 weights back to float32 for model.load_state_dict()."""
-    state_dict = {}
-    processed = set()
+    """Dequantize INT8 weights back to float32 for model.load_state_dict().
 
-    for key in quant_dict:
+    Same expansion as sathmr_common.dequantize_int8_weight_state_dict_if_needed(); kept here
+    so this tool does not pull in sathmr_common's demo dependencies.
+    """
+    state_dict = {}
+    for key, tensor in quant_dict.items():
         if key.endswith(".weight_int8"):
             base = key[: -len("_int8")]  # e.g. "foo.weight"
-            scale_key = base + "_scale"
-            w_int8 = quant_dict[key].float()
-            scale = quant_dict[scale_key].float().unsqueeze(1)
-            state_dict[base] = (w_int8 * scale).to(quant_dict[key].dtype if False else torch.float32)
-            processed.add(key)
-            processed.add(scale_key)
-        elif key.endswith(".weight_scale"):
-            if key not in processed:
-                # orphan scale without matching int8 (shouldn't happen)
-                pass
-        else:
-            state_dict[key] = quant_dict[key]
-
+            scale = quant_dict[base + "_scale"].float().unsqueeze(1)
+            state_dict[base] = (tensor.float() * scale).to(torch.float32)
+        elif not key.endswith(".weight_scale"):
+            state_dict[key] = tensor
     return state_dict
 
 
@@ -126,7 +115,7 @@ def main() -> None:
                 err = (deq_dict[key] - orig.float()).abs().max().item()
                 max_errs.append((key, err))
         max_errs.sort(key=lambda x: -x[1])
-        print(f"  Top-5 max abs errors:")
+        print("  Top-5 max abs errors:")
         for key, err in max_errs[:5]:
             print(f"    {key}: {err:.6f}")
         print(f"  Overall max abs error: {max_errs[0][1]:.6f}" if max_errs else "  No quantized tensors to verify")

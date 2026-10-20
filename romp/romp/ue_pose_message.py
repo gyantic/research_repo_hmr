@@ -1,6 +1,6 @@
 """Convert one ROMP person (SMPL pose + camera) into the text payload read by Unreal Engine.
 
-Payload body (the transport adds its own terminator: "\\n" for UDP, "\\x00" for TCP):
+Payload body (the UDP sender appends "\\n"):
 
     q0x,q0y,q0z,q0w,...,q23x,q23y,q23z,q23w|c0,c1,c2
 

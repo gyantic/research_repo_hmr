@@ -94,16 +94,15 @@ def main() -> int:
     torch_np = [x.detach().cpu().numpy() for x in torch_outs]
 
     available = ort.get_available_providers()
+    providers = available
     if args.ort_provider:
-        providers = [args.ort_provider]
-        if args.ort_provider not in available:
+        if args.ort_provider in available:
+            providers = [args.ort_provider]
+        else:
             print(
                 f"[WARN] Requested provider {args.ort_provider} not in available providers {available}. "
                 "Falling back to default provider list."
             )
-            providers = available
-    else:
-        providers = available
 
     print(f"[INFO] ONNX Runtime providers: {providers}")
     sess = ort.InferenceSession(args.onnx, providers=providers)

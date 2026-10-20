@@ -75,7 +75,7 @@ case "${1:-}" in
         ;;
     udp)
         env "${COMMON_ENV[@]}" "${INT8_ENV[@]}" "$PYTHON" -u run_publisher_ue.py --source video --video "$VIDEO" \
-            --intrinsics videos/camera.json --no-loop --image-size 512 --yolo-model checkpoints/yolo/yolo11m-pose.engine \
+            --intrinsics "$MEASUREMENTS/camera.json" --no-loop --image-size 512 --yolo-model checkpoints/yolo/yolo11m-pose.engine \
             --nn-model-dir mhr2smpl/experiments/multiview_n30000_e500 --mhr2smpl-mapping-path mhr2smpl/data/mhr2smpl_mapping.npz \
             --metrics-csv "$OUT_DIR/raw_fastsam3dbody_int8_trt_udp_ue_frames.csv" \
             --summary-csv "$OUT_DIR/raw_fastsam3dbody_int8_trt_udp_ue_summary.csv" \

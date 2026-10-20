@@ -16,7 +16,6 @@ TensorRTエンジン
 from __future__ import annotations
 
 import argparse
-import csv
 from pathlib import Path
 from typing import List, Tuple
 
@@ -25,11 +24,7 @@ import onnx
 from onnx import numpy_helper
 from onnxruntime.quantization import CalibrationDataReader, QuantFormat, QuantType, quantize_static
 
-from calib_image_utils import (
-    preprocess_calibration_image,
-    resolve_manifest_path,
-    unique_paths,
-)
+from calib_image_utils import collect_calibration_images, preprocess_calibration_image
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,46 +75,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_manifest_images(manifest_path: Path) -> List[Path]:
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-    images: List[Path] = []
-    with manifest_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            raise RuntimeError(f"Invalid manifest (no header): {manifest_path}")
-        for row in reader:
-            image_path = row.get("image_path", "").strip()
-            if not image_path:
-                vals = list(row.values())
-                image_path = vals[1].strip() if len(vals) >= 2 and vals[1] else ""
-            if not image_path:
-                continue
-            p = resolve_manifest_path(image_path, manifest_path)
-            if p.is_file():
-                images.append(p)
-    return images
-
-
-def load_dir_images(calib_dir: Path) -> List[Path]:
-    if not calib_dir.is_dir():
-        raise FileNotFoundError(f"Calibration directory not found: {calib_dir}")
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-    images: List[Path] = []
-    for ext in exts:
-        images.extend(sorted(calib_dir.glob(ext)))
-    return images
-
-
 def collect_images(args: argparse.Namespace) -> List[Path]:
-    images: List[Path] = []
-    if args.calib_manifest:
-        images.extend(load_manifest_images(Path(args.calib_manifest)))
-    if args.calib_dir:
-        images.extend(load_dir_images(Path(args.calib_dir)))
-    images = unique_paths(images)
-    if args.max_images > 0:
-        images = images[: args.max_images]
+    images = collect_calibration_images(args.calib_manifest, args.calib_dir, args.max_images)
     if not images:
         raise RuntimeError("No calibration images found. Use --calib_manifest and/or --calib_dir")
     return images
@@ -143,6 +100,39 @@ def _reshape_for_axis(vec: np.ndarray, ndim: int, axis: int) -> np.ndarray:
     shape = [1] * ndim
     shape[axis] = vec.shape[0]
     return vec.reshape(shape)
+
+
+def _dq_axis(node: onnx.NodeProto, ndim: int) -> int:
+    """DequantizeLinear axis attribute (default 1) with negative values wrapped; not range-checked."""
+    axis = 1
+    for attr in node.attribute:
+        if attr.name == "axis":
+            axis = int(attr.i)
+            break
+    if axis < 0:
+        axis += ndim
+    return axis
+
+
+def _dequantize(q_arr: np.ndarray, s_arr: np.ndarray, zp_arr, axis: int):
+    """(q - zero_point) * scale, or None if the per-axis scale / zero point does not match q."""
+    qf = q_arr.astype(np.float32)
+    if s_arr.ndim == 0:
+        zpf = float(zp_arr) if zp_arr is not None else 0.0
+        return (qf - zpf) * float(s_arr)
+
+    if s_arr.shape[0] != q_arr.shape[axis]:
+        return None
+    s_b = _reshape_for_axis(s_arr, q_arr.ndim, axis)
+    if zp_arr is None:
+        z_b = 0.0
+    elif zp_arr.ndim == 0:
+        z_b = float(zp_arr)
+    elif zp_arr.shape[0] != q_arr.shape[axis]:
+        return None
+    else:
+        z_b = _reshape_for_axis(zp_arr, q_arr.ndim, axis)
+    return (qf - z_b) * s_b
 
 
 def apply_trt_int32_dq_bias_fix(onnx_path: Path) -> int:
@@ -178,42 +168,20 @@ def apply_trt_int32_dq_bias_fix(onnx_path: Path) -> int:
         s_arr = numpy_helper.to_array(s_init).astype(np.float32)
         zp_arr = numpy_helper.to_array(zp_init).astype(np.float32) if zp_init is not None else None
 
-        axis = 1
-        for attr in node.attribute:
-            if attr.name == "axis":
-                axis = int(attr.i)
-                break
-        if axis < 0:
-            axis += q_arr.ndim
+        axis = _dq_axis(node, q_arr.ndim)
         if axis < 0 or axis >= q_arr.ndim:
             kept_nodes.append(node)
             continue
 
-        qf = q_arr.astype(np.float32)
-        if s_arr.ndim == 0:
-            zpf = float(zp_arr) if zp_arr is not None else 0.0
-            deq = (qf - zpf) * float(s_arr)
-        else:
-            if s_arr.shape[0] != q_arr.shape[axis]:
-                kept_nodes.append(node)
-                continue
-            s_b = _reshape_for_axis(s_arr, q_arr.ndim, axis)
-            if zp_arr is None:
-                z_b = 0.0
-            else:
-                if zp_arr.ndim == 0:
-                    z_b = float(zp_arr)
-                else:
-                    if zp_arr.shape[0] != q_arr.shape[axis]:
-                        kept_nodes.append(node)
-                        continue
-                    z_b = _reshape_for_axis(zp_arr, q_arr.ndim, axis)
-            deq = (qf - z_b) * s_b
+        deq = _dequantize(q_arr, s_arr, zp_arr, axis)
+        if deq is None:
+            kept_nodes.append(node)
+            continue
 
-        out_name = node.output[0]
-        graph.initializer.append(numpy_helper.from_array(deq.astype(np.float32), name=out_name))
+        # Drop this DQ node: its consumers already refer to node.output[0], which the
+        # new initializer now provides.
+        graph.initializer.append(numpy_helper.from_array(deq.astype(np.float32), name=node.output[0]))
         replaced += 1
-        # Drop this DQ node. Consumers already refer to out_name, now provided by initializer.
 
     if replaced == 0:
         return 0

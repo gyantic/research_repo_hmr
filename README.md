@@ -18,26 +18,84 @@ ROMP・SAT-HMR・Fast-SAM-3D-Bodyを対象に、推定精度と推論速度を�
 
 ![システム概要](assets/system_overview.png)
 
-UE連携では、衣装の重畳、人物の周囲を回る球による遮蔽表現、落下する岩と人体の衝突表現を扱います。
+衣装の重畳、人物の周囲を回る球による遮蔽表現、落下する岩と人体の衝突表現を扱います。
 
 ## 各ディレクトリの内容の概要
 
 | ディレクトリ | 内容 |
 |---|---|
-| [ue/](ue/) | UEパッケージを使った動画推論・録画・実写との合成。UEプロジェクトはGitHub Releasesで配布 |
-| [romp/](romp/) | ROMPの改変版。動画推論、量子化、UEへの姿勢配信 |
-| [sat-hmr/](sat-hmr/) | SAT-HMRの改変版。INT8量子化、コンパイル、ONNX/TensorRT、UEへの姿勢配信 |
-| [fast-sam-3d-body/](fast-sam-3d-body/) | Fast-SAM-3D-Bodyの改変版。TensorRTによる高速化、MHR→SMPL変換、UEへの姿勢配信 |
-| [measurements/](measurements/) | 論文の計測（速度・精度・UE同時実行）の実行スクリプト、集計、図の生成 |
+| [ue/](ue/) | UEパッケージを使った動画推論・録画・実写との合成（UEプロジェクトはGitHub Releasesで配布） |
+| [romp/](romp/) | ROMPの改変版。bf16化、torch.compile、UEへの姿勢送信 |
+| [sat-hmr/](sat-hmr/) | SAT-HMRの改変版。bf16化・INT8量子化、torch.compile、TensorRT、UEへの姿勢送信 |
+| [fast-sam-3d-body/](fast-sam-3d-body/) | Fast-SAM-3D-Bodyの改変版。bf16化・INT8量子化（TensorRT）、torch.compile、MHR→SMPL変換、UEへの姿勢送信 |
+| [measurements/](measurements/) | 論文の計測（速度・精度・UE同時実行）、集計、図の生成 |
+
+以下の手順でファイルを配置した後の構成は次のとおりです。
+
+```text
+research_repo_hmr/
+├── body_models/smpl/
+│   ├── SMPL_NEUTRAL.pkl
+│   ├── SMPL_MALE.pkl
+│   ├── SMPL_FEMALE.pkl
+│   ├── SMPL_NEUTRAL.pth
+│   ├── SMPLA_NEUTRAL.pth
+│   ├── smpl_mean_params.npz
+│   ├── body_verts_smpl.npy
+│   ├── J_regressor_h36m_correct.npy
+│   ├── J_regressor_extra.npy
+│   ├── J_regressor_h36m.npy
+│   └── smpl_kid_template.npy
+├── checkpoints/moge2/
+│   └── model.pt
+├── sat-hmr/weights/sat_hmr/
+│   ├── sat_644.pth
+│   ├── sat_644_bf16.pth
+│   ├── sat_644_int8w.pth
+│   ├── sat_644_3dpw.pth
+│   └── sat_644_3dpw_int8w.pth
+├── romp/trained_models/
+│   ├── ROMP_HRNet32_V1.pkl
+│   ├── ROMP_HRNet32_V1_bf16.pth
+│   └── ROMP_ResNet50_V1.pkl
+├── fast-sam-3d-body/
+│   ├── checkpoints/
+│   │   ├── sam-3d-body-dinov3/
+│   │   │   ├── model.ckpt
+│   │   │   ├── assets/mhr_model.pt
+│   │   │   └── backbone_trt/backbone_dinov3_int8.engine
+│   │   ├── yolo/
+│   │   │   ├── yolo11m-pose.pt
+│   │   │   └── yolo11m-pose.engine
+│   │   └── moge_trt/
+│   │       └── moge_dinov2_encoder_int8.engine
+│   └── mhr2smpl/
+│       ├── experiments/multiview_n30000_e500/
+│       └── data/
+│           ├── mhr2smpl_mapping.npz
+│           └── mhr_face_mask.ply
+└── datasets/
+    ├── 3dpw/
+    │   ├── imageFiles/
+    │   ├── sequenceFiles/
+    │   ├── annots.npz
+    │   ├── vibe_db/
+    │   ├── annots_smpl_train_genders.npz
+    │   └── annots_smpl_test_genders.npz
+    ├── videos/
+    │   └── sample_video.mp4
+    └── cmu_panoptic/
+        └── person_clips/
+```
 
 
-## UEパッケージによる動画生成
+## UEパッケージを使用した動画の作成
 
-用意したUEパッケージを指定し、リポジトリのルートからカメラ推定・SAT-HMR推論・UE録画・合成動画の出力を一括で実行します。コード・モデル・標準の出力先はリポジトリの場所から解決し、推論とカメラ推定には起動したPythonを使用します。ユーザー名、condaの配置場所、WSLの名前を設定する必要はありません。
+用意したUEパッケージを指定し、リポジトリのルートからカメラ推定・SAT-HMR推論・UE録画・合成動画の出力を一括で実行します。
 
 ### 環境の準備
 
-CUDA対応のNVIDIA GPU、conda、Git、FFmpeg（ffmpegとffprobe）を用意し、リポジトリのルートで実行します。
+リポジトリのルートで以下を実行します。
 
 ```bash
 conda env create -f ue/environment.yml
@@ -51,13 +109,11 @@ chumpyにはPython 3.11・NumPyとの互換修正が必要です。[互換修正
 python -c 'import torch, chumpy; from moge.model.v2 import MoGeModel; assert torch.cuda.is_available()'
 ```
 
-この環境はSAT-HMRとMoGeを同じPythonで使用する構成です。MoGeと関連ライブラリはGitの特定コミットを指定しています。後述のモデル別環境は使用しません。
 
 ### モデルの取得と配置
 
-バイナリ重みはGit追跡外のため、clone後に取得・配置してください。
 
-| 資産 | 取得元 | 配置先 |
+| ファイル | 取得元 | 配置先 |
 |---|---|---|
 | SAT-HMR `sat_644.pth` | [SAT-HMR公式配布](https://huggingface.co/ChiSu001/SAT-HMR/tree/main/weights/sat_hmr) | `sat-hmr/weights/sat_hmr/sat_644.pth` |
 | SMPL male / female | [SMPL公式サイト](https://smpl.is.tue.mpg.de/) | `body_models/smpl/SMPL_MALE.pkl`、`SMPL_FEMALE.pkl` |
@@ -65,9 +121,9 @@ python -c 'import torch, chumpy; from moge.model.v2 import MoGeModel; assert tor
 | SMPL補助データ | [SAT-HMR公式のGoogle Drive](https://drive.google.com/drive/folders/1wmd_pjmmDn3eSl3TLgProgZgCQZgtZIC?usp=sharing) | 同フォルダに `smpl_mean_params.npz`、`body_verts_smpl.npy`、`J_regressor_h36m_correct.npy` |
 | MoGe-2 ViT-S normal `model.pt` | [MoGe公式モデル配布](https://huggingface.co/Ruicheng/moge-2-vits-normal/tree/main) | `checkpoints/moge2/model.pt` |
 
-SMPLは `body_models/smpl/` の1か所にだけ置きます。SAT-HMR・ROMP・Fast-SAM-3D-Bodyはすべてここを読みます。
+SMPLモデルは `body_models/smpl/` に置きます。
 
-SMPLモデルは各公式サイトでユーザー登録し、利用条件に同意してから取得します。ダウンロードしたファイルは次のように名前を変更して配置してください。
+SMPLモデルは各公式サイトでダウンロードしてください。取得したファイルは次のように名前を変更して配置します。
 
 | ダウンロードしたファイル | 配置するファイル名 |
 |---|---|
@@ -82,7 +138,7 @@ mv /path/to/basicModel_f_lbs_10_207_0_v1.0.0.pkl body_models/smpl/SMPL_FEMALE.pk
 mv /path/to/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl body_models/smpl/SMPL_NEUTRAL.pkl
 ```
 
-配置後の構成は次のとおりです。
+配置後は以下のようになります。
 
 ```text
 body_models/smpl/
@@ -94,7 +150,6 @@ body_models/smpl/
   J_regressor_h36m_correct.npy
 ```
 
-DINOv2の単独重みは学習用です。この動画生成にはFast-SAM-3D-Body本体の重みや評価データセットも不要です。
 
 ### UEパッケージの作成
 
@@ -102,9 +157,10 @@ UEパッケージ（Normal・RockDrop・SphereOrbit）はSMPLを含むため配�
 
 必要なもの：
 
-- Windows 10/11、Unreal Engine 5.5.4、Visual Studio 2022（C++によるゲーム開発ワークロード）
-- UEプラグイン Simple TCP UDP Socket Client（作者 Socke、プラグイン名 `SocketClient`。[Fab](https://www.fab.com/)で取得し、UE 5.5のエンジンにインストール）
-- [環境の準備](#環境の準備)で作成した `hmr` 環境
+- Windows 10/11、Visual Studio 2022（C++によるゲーム開発ワークロード）
+- Unreal Engine 5.5.4（[Epic Games Launcher](https://www.unrealengine.com/download)からインストール）
+- UEプラグイン Simple TCP UDP Socket Client（作者 Socke、プラグイン名 `SocketClient`）。[Fab](https://www.fab.com/listings/d19071be-473f-4dcb-8a95-ced3eda6667d)で入手し、Epic Games Launcherで UE 5.5.4 に「エンジンにインストール」します
+- [環境の準備](#環境の準備)で作成した `hmr` 環境（手順3で使用）
 
 手順：
 
@@ -142,23 +198,7 @@ UEパッケージ（Normal・RockDrop・SphereOrbit）はSMPLを含むため配�
    powershell -ExecutionPolicy Bypass -File Tools\package-recording.ps1
    ```
 
-作成したパッケージや、生成される `Interchange/SMPL.glb`・`Content/SMPL.uasset`・`Content/SMPL_Skeleton.uasset` はSMPLを含むため、再配布しないでください。衣装素材のクレジットは [ue/README.md](ue/README.md#同梱素材のクレジット) にあります。
-
-### UEパッケージの指定
-
-`--package` には、作成したパッケージのうち1つを指定します。指定するフォルダは次の構成です。
-
-```text
-<package>/
-  package-manifest.json
-  Windows/
-    MyProject_ROMP.exe
-    ...（パッケージのほかの同梱ファイル）
-```
-
-現在のUEパッケージはWin64用です。Windowsでは直接起動し、WSLから実行する場合はWindows相互運用を使ってUEを起動します。UEへ渡すファイルパスだけをWindows形式へ変換し、推論や合成は起動元の環境で動きます。
-
-UE録画にはWindows版FFmpegも使用します。通常はWindowsのPATHから検出します。別の実行ファイルを使用する場合は `--recorder-ffmpeg` で指定します。推論側の `--ffmpeg`・`--ffprobe` は起動元の環境で使用する実行ファイルです。
+作成したパッケージや、生成される `Interchange/SMPL.glb`・`Content/SMPL.uasset`・`Content/SMPL_Skeleton.uasset` はSMPLを含むため、再配布しないでください。
 
 ### 実行と出力
 
@@ -167,49 +207,69 @@ conda activate hmr
 python ue/run_video.py --package /path/to/Normal --video /path/to/input.mp4
 ```
 
-`package-manifest.json` に従って演出を選びます。
-
-標準の出力先は次のとおりです。
+`--package` には、作成したパッケージのフォルダ（`Deliverables/Normal`・`RockDrop`・`SphereOrbit` のいずれか）を指定します。指定したパッケージの演出で、合成した動画が次の場所に出力されます。
 
 ```text
-results/ue/<演出名>/Recordings/<実行日時>/composite/final.mp4
+results/ue/<Normal・RockDrop・SphereOrbit>/Recordings/<実行日時>/composite/final.mp4
 ```
 
-`<演出名>` は `package-manifest.json` の `scene_mode` から決まり、Normal・RockDrop・SphereOrbitのいずれかになります。任意の出力先は `--output` で指定します。その他のオプションは `python ue/run_video.py --help` を参照してください。
+出力先は `--output` で変更できます。
 
 ## モデル別の環境と実行
 
-研究・評価に使用した環境は、モデルごとの `environment.yml` に記録しています。
+使用した環境は、モデルごとの `environment.yml` から作成します。
 
-| モデル | 環境ファイル | 環境名 |
-|---|---|---|
-| ROMP | [romp/environment.yml](romp/environment.yml) | `romp_3.9` |
-| SAT-HMR | [sat-hmr/environment.yml](sat-hmr/environment.yml) | `sathmr-copy` |
-| Fast-SAM-3D-Body | [fast-sam-3d-body/environment.yml](fast-sam-3d-body/environment.yml) | `sam_3d_body` |
-
-以下のようにすることで環境を再現できます。
 ```bash
-conda env create -f <モデルのディレクトリ>/environment.yml
-conda activate <環境名>
+conda env create -f romp/environment.yml              # 環境名 romp_3.9
+conda env create -f sat-hmr/environment.yml           # 環境名 sathmr-copy
+conda env create -f fast-sam-3d-body/environment.yml  # 環境名 sam_3d_body
 ```
 
 ### 3DPWの配置
 
-精度評価に使う3DPWは、3モデルで共用する `datasets/3dpw/` に置きます。[3DPW公式サイト](https://virtualhumans.mpi-inf.mpg.de/3DPW/)から `imageFiles` と `sequenceFiles` を取得し、各モデルの評価に必要な前処理済みの注釈ファイルを同じフォルダに加えます。
+精度評価に使う3DPWは　`datasets/3dpw/` に置きます。[3DPW公式サイト](https://virtualhumans.mpi-inf.mpg.de/3DPW/)から `imageFiles` と `sequenceFiles` を取得し、各モデルの評価に必要な前処理済みの注釈ファイルを同じフォルダに加えます。
 
 ```text
 datasets/3dpw/
   imageFiles/
   sequenceFiles/
-  annots.npz, vibe_db/                  # ROMP（元のリポジトリの手順で作成）
-  annots_smpl_{train,test}_genders.npz  # SAT-HMR（元のリポジトリの手順で取得）
+  annots.npz, vibe_db/                  # ROMP
+  annots_smpl_{train,test}_genders.npz  # SAT-HMR
+```
+
+ROMPの注釈ファイルは [romp/docs/dataset.md](romp/docs/dataset.md)、SAT-HMRの注釈ファイルは [sat-hmr/docs/data_preparation.md](sat-hmr/docs/data_preparation.md) の手順で用意します。
+
+### 速度計測の入力動画の配置
+
+[動画ACの素材](https://video-ac.com/video/1201)のHDサイズ（1280×720）をダウンロードし、`datasets/videos/sample_video.mp4` として置きます。
+
+### CMU Panoptic Studioの動画の配置
+
+論文の図・UEのデモでは、[CMU Panoptic Studio](https://github.com/CMU-Perceptual-Computing-Lab/panoptic-toolbox) のHD映像（カメラ `hd_00_00`）から、人物が1人だけ映っている15秒を切り出した次の動画を使用しました。pose2_p02 は概要図（図1・図4(A)）、残りの8本はデモに使用しています。
+
+| 名前 | シーケンス |
+|---|---|
+| pose1_p01 | `171026_pose1` |
+| pose2_p01 | `171204_pose2` |
+| pose2_p02 | `171204_pose2` |
+| pose2_p07 | `171204_pose2` |
+| pose3_p01 | `171204_pose3` |
+| pose3_p02 | `171204_pose3` |
+| pose4_p01 | `171204_pose4` |
+| pose4_p03 | `171204_pose4` |
+| pose5_p03 | `171204_pose5` |
+
+次のコマンドでHD映像を取得し、`datasets/cmu_panoptic/person_clips/` に切り出します。
+
+```bash
+python measurements/cmu_panoptic/make_person_clips.py
 ```
 
 ### ROMP
 
 [学習済みモデル](https://github.com/Arthur151/ROMP#installation)と[SMPLモデルデータ](https://github.com/Arthur151/ROMP#installation)を取得し、次の場所へ配置します。モデル、数値精度、コンパイルの条件は `measurements/romp/configs/` のYAMLとコマンド引数で指定します。
 
-| 資産 | 配置先 |
+| ファイル | 配置先 |
 |---|---|
 | 学習済みモデル `ROMP_HRNet32_V1.pkl`、`ROMP_ResNet50_V1.pkl` | `romp/trained_models/`（YAMLの `model_path` から参照） |
 
@@ -224,7 +284,7 @@ conda activate romp_3.9
 python -c "import runpy, sys; sys.argv = ['pack', '-source_dir=$PWD/body_models/smpl', '--save_dir=$PWD/body_models/smpl']; runpy.run_path('romp/simple_romp/romp/pack_smpl_info.py')['main']()"
 ```
 
-bf16・INT8の重み（`ROMP_HRNet32_V1_bf16.pth` など）は配布されていません。`romp/tools/` のエクスポートスクリプトで `romp/trained_models/` に生成します。
+bf16の重み（`ROMP_HRNet32_V1_bf16.pth`）は配布されていません。[計測用の重みの作成](#計測用の重みの作成)のとおり生成します。
 
 ```bash
 conda activate romp_3.9
@@ -240,9 +300,7 @@ PYTHONPATH="$PWD:$PWD/romp" PYOPENGL_PLATFORM=egl python romp_video_demo.py \
 | ファイル | 内容 |
 |---|---|
 | [romp/romp_video_demo.py](romp/romp_video_demo.py) | 動画入力のベンチマーク用デモ |
-| [romp/romp/generator_bonebasedMesh.py](romp/romp/generator_bonebasedMesh.py) | SMPL姿勢を関節クォータニオンへ変換し、TCPでUEへ送信。推論時間の統計CSVも出力 |
-| [romp/romp/generator_bonebasedMesh_UDPver.py](romp/romp/generator_bonebasedMesh_UDPver.py) | 上記のUDP版（ffmpegで12 fpsに揃えて入力） |
-| `romp/tools/export_torchao_int8_backbone_romp.py`、`export_quantized_weights_romp.py` | INT8量子化重みのエクスポート |
+| `romp/tools/export_quantized_weights_romp.py` | 量子化重みのエクスポート |
 
 ### SAT-HMR
 
@@ -257,21 +315,29 @@ python video_demo.py \
   --no_render --no_save
 ```
 
-`--no_render --no_save` は描画・動画保存を省略します。量子化、コンパイル、UDP配信などの条件は `python video_demo.py --help` で確認してください。論文のSAT-HMRの速度・精度はこのスクリプトで計測しています。
+量子化、コンパイル、UDP配信などの条件は `python video_demo.py --help` で確認してください。論文のSAT-HMRの速度・精度はこのスクリプトで計測しています。
 
 | ファイル | 内容 |
 |---|---|
 | [sat-hmr/video_demo.py](sat-hmr/video_demo.py) | PyTorchによる動画推論。SMPL姿勢のUEへのUDP送信と描画 |
-| `sat-hmr/video_demo_onnx.py`、`video_demo_trt.py` | ONNX Runtime版、TensorRT版 |
-| `sat-hmr/webcam_demo.py`、`webcam_demo_trt.py` | Webカメラでの実時間推論 |
-| `sat-hmr/sathmr_tcp_benchmark.py`、`sathmr_udp_benchmark.py` | 通信方式別の速度ベンチマーク |
-| `sat-hmr/models/int8_attention.py`、`static_int8_fused.py`、`grouped_linear.py`、`triton_grouped_int8.py` | INT8量子化の中核（`grouped_linear.py`・`triton_grouped_int8.py` は `tools/benchmark_grouped_bbox_int8.py` で使用） |
-| [sat-hmr/tools/](sat-hmr/tools/) | 量子化、ONNX/TensorRTエクスポート、キャリブレーション、3DPW評価、通信ベンチマークなど。一括実行は `run_*.sh` |
+| `sat-hmr/video_demo_trt.py` | TensorRT版 |
+| `sat-hmr/webcam_demo_trt.py` | Webカメラでの実時間推論（TensorRT） |
+| `sat-hmr/models/int8_attention.py`、`static_int8_fused.py` | INT8量子化の中核 |
+| [sat-hmr/tools/](sat-hmr/tools/) | 量子化、ONNX/TensorRTエクスポート、キャリブレーション、TensorRTでの3DPW評価 |
 | `sat-hmr/configs/run/eval_3dpw_*.yaml`、`train_qat.yaml` | 3DPW評価・QATの設定 |
 
 ### Fast-SAM-3D-Body
 
-SAM-3D-Body・DINOv3・MoGe・YOLOの重みとMHRモデルを公式配布元から取得し、`fast-sam-3d-body/checkpoints/` などへ配置します。MHR→SMPL変換に使う `mhr2smpl_mapping.npz` と `mhr_face_mask.ply` は、[MHR](https://github.com/facebookresearch/MHR)の `tools/mhr_smpl_conversion/assets/` から `fast-sam-3d-body/mhr2smpl/data/` へ配置します。3DPWは[3DPWの配置](#3dpwの配置)のとおりです。TensorRTエンジンは使用するGPU・実行環境に合わせて、下記の変換スクリプトで生成します。
+次の重みを取得して配置します（MoGe-2は初回実行時に自動で取得されます）。
+
+| ファイル | 取得元 | 配置先 |
+|---|---|---|
+| SAM 3D Body（DINOv3）`model.ckpt`、`assets/mhr_model.pt` | [facebook/sam-3d-body-dinov3](https://huggingface.co/facebook/sam-3d-body-dinov3)（利用申請が必要） | `fast-sam-3d-body/checkpoints/sam-3d-body-dinov3/` |
+| YOLO11 Pose `yolo11m-pose.pt` | [Ultralytics](https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11m-pose.pt) | `fast-sam-3d-body/checkpoints/yolo/` |
+| MHR→SMPL変換モデル（`best_model.pth`、`sample_idx.npy` など） | [元のリポジトリ](https://github.com/yangtiming/Fast-SAM-3D-Body/tree/49b0fe0/mhr2smpl/experiments)の `mhr2smpl/experiments/` | `fast-sam-3d-body/mhr2smpl/experiments/` |
+| `mhr2smpl_mapping.npz`、`mhr_face_mask.ply` | [MHR](https://github.com/facebookresearch/MHR)の `tools/mhr_smpl_conversion/assets/` | `fast-sam-3d-body/mhr2smpl/data/` |
+
+TensorRTエンジンは [fast-sam-3d-body/README.md](fast-sam-3d-body/README.md#tensorrtエンジンの作成) の手順で作成します。
 
 UEへの配信には `run_publisher_ue.py` を使用します。SMPLモデル、MHR→SMPL変換モデル、対応表などの指定は `python run_publisher_ue.py --help` で確認してください。速度計測と精度評価は[精度・速度の評価](#精度速度の評価)のスクリプトで行います。
 
@@ -279,22 +345,46 @@ UEへの配信には `run_publisher_ue.py` を使用します。SMPLモデル、
 |---|---|
 | [fast-sam-3d-body/run_publisher_ue.py](fast-sam-3d-body/run_publisher_ue.py) | リアルタイムSMPLパブリッシャ。ZMQ配信に加え、UEへUDP/TCP送信。INT8/TensorRTバックボーン・CUDA Graph・compileを環境変数で制御。論文のINT8 TensorRT・UE連携時の速度計測で使用 |
 | `fast-sam-3d-body/mocap/realtime/ue_sender.py` | `run_publisher_ue.py` が使うUE送信モジュール |
-| `fast-sam-3d-body/check_int8_layers.py` | TensorRTエンジンの各テンソルのdtype（INT8/FP16/FP32）を検査 |
-| `fast-sam-3d-body/profile_components.py` | forwardのコンポーネント別の時間計測 |
 | `fast-sam-3d-body/build_tensorrt.sh`、`convert_backbone_tensorrt.py`、`convert_moge_encoder_trt.py`、`convert_yolo_pose_trt.py`、`sam_3d_body/models/backbones/dinov3_tensorrt.py` | TensorRT変換 |
 | [fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py](fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py) | 精度評価の入力となる3DPW推論サンプル（`sample_*.npz`）の生成 |
 
 ## 精度・速度の評価
 
-論文の計測（速度・精度・UE同時実行）を実行するスクリプトと、集計・図の生成コードは [measurements/](measurements/) にモデルごとにまとめています。実行方法は [measurements/README.md](measurements/README.md) を参照してください。
+[モデル別の環境と実行](#モデル別の環境と実行)の準備に加え、次の重みを作成してから実行します。
 
-| ディレクトリ・ファイル | 内容 |
-|---|---|
-| [measurements/romp/](measurements/romp/) | ROMPの計測の実行（`run.sh`）、UE同時実行の計測、`romp_video_demo.py` に渡す設定（`configs/`） |
-| [measurements/sathmr/](measurements/sathmr/) | SAT-HMRの計測の実行（`run.sh`：速度・compile範囲・UE同時実行） |
-| [measurements/fastsam/](measurements/fastsam/) | Fast-SAM-3D-Bodyの計測の実行（`run.sh`）、速度計測、3DPWの精度評価、bf16重みの作成 |
-| [measurements/summarize_speed.py](measurements/summarize_speed.py) | 生データから推論時間の中央値・MADを出す |
-| [measurements/paper_figures/](measurements/paper_figures/) | 論文の図2・図3・図5の生成 |
+### 計測用の重みの作成
+
+ROMPのbf16重み（`romp_3.9` 環境、`romp/` から実行）：
+
+```bash
+python tools/export_quantized_weights_romp.py --input trained_models/ROMP_HRNet32_V1.pkl --output trained_models/
+```
+
+SAT-HMR（`sathmr-copy` 環境、`sat-hmr/` から実行）。精度評価用の `sat_644_3dpw.pth` も[SAT-HMR公式配布](https://huggingface.co/ChiSu001/SAT-HMR/tree/main/weights/sat_hmr)から取得して同じフォルダに置きます。
+
+```bash
+python -c "import torch; sd = torch.load('weights/sat_hmr/sat_644.pth', map_location='cpu'); torch.save({k: v.to(torch.bfloat16) for k, v in sd.items()}, 'weights/sat_hmr/sat_644_bf16.pth')"
+python tools/quantize_weights_int8.py --input weights/sat_hmr/sat_644.pth --output weights/sat_hmr/sat_644_int8w.pth
+python tools/quantize_weights_int8.py --input weights/sat_hmr/sat_644_3dpw.pth --output weights/sat_hmr/sat_644_3dpw_int8w.pth
+```
+
+### 計測の実行と論文の図
+
+Normalパッケージを先に起動しておき（図5の計測に使用）、リポジトリのルートから実行します。リポジトリ直下に `paper_results.csv` が作成されます。
+
+```bash
+bash measurements/run_all.sh
+```
+
+論文の図は `results_png/` に出力されます。
+
+```bash
+python measurements/paper_figures/plot_speed_vs_accuracy.py         # 図2
+python measurements/paper_figures/plot_sathmr_int8_compile_scope.py # 図3
+python measurements/paper_figures/plot_udp_overhead.py              # 図5
+```
+
+脚注1の値は `results/measurements/rerun_<日時>/` の `accuracy_fastsam_fp32/metrics_paper_3dpw14.json`（`PA-MPJPE`）と `accuracy_sathmr_fp32.txt`（`PAPER-PA-MPJPE`）に出ます。
 
 ## 参照リポジトリ
 
@@ -308,7 +398,7 @@ UEへの配信には `run_publisher_ue.py` を使用します。SMPLモデル、
 
 ## ライセンス
 
-このリポジトリ全体に単一のライセンスはありません。各ディレクトリのコードは、下表のライセンスに従います（改変したモデルのコードは元のリポジトリのライセンス）。モデルの重み・データセット・素材は、それぞれの配布元の条件に従って各自で取得してください。これらはリポジトリにもGitHub Releasesにも含めていません。例外は衣装素材（CC BY 4.0）で、Releasesで配布しているUEプロジェクトのzipに含めています。
+このリポジトリ全体に単一のライセンスはありません。各ディレクトリのコードは、下表のライセンスに従います。モデルの重み・データセットは、それぞれの配布元の条件に従って取得してください。
 
 ### コード
 
@@ -338,7 +428,7 @@ UEへの配信には `run_publisher_ue.py` を使用します。SMPLモデル、
 | CMU Panoptic Studio | [panoptic-toolbox](https://github.com/CMU-Perceptual-Computing-Lab/panoptic-toolbox) に記載の条件（非商用・研究目的のみ。利用時は論文を引用） |
 | 速度計測の入力動画 | [動画AC利用規約](https://video-ac.com/terms)（商用利用・加工可。単独での再配布不可） |
 
-データはいずれもリポジトリに含めていません。CMU Panoptic Studio はシーケンス `171026_pose1`・`171204_pose2`〜`171204_pose5` から切り出した8本のクリップのみを使用しています（[measurements/README.md](measurements/README.md#入力データ)）。速度計測の入力動画は[素材ページ](https://video-ac.com/video/1201)から各自で取得してください。
+データはいずれもリポジトリに含めていません。CMU Panoptic Studio は[CMU Panoptic Studioの動画の配置](#cmu-panoptic-studioの動画の配置)の9本のクリップのみを使用しています。
 
 ### UEプロジェクト（GitHub Releases）
 

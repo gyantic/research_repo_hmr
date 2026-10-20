@@ -144,9 +144,6 @@ output/
 /sat-hmr/docs/*.md
 !/sat-hmr/docs/fix_chumpy.md
 !/sat-hmr/docs/data_preparation.md
-# プロット用スクリプトは measurements/ 以外では Git に含めない
-/sat-hmr/tools/plot_*.py
-/sat-hmr/tools/run_plots.sh
 
 # UE project (without SMPL) is distributed as a GitHub Release zip (ue-unreal-project.zip), not tracked in Git
 /ue/unreal/

@@ -5,6 +5,10 @@ Passes:
 1) Fix Where broadcast mismatch (cond [N] with y [N, ...])
 2) Rewrite the problematic bool Where pattern to arithmetic ops (no Where kernel needed)
 3) Replace Split nodes with single output by Identity (B=1 export path)
+4) Rewrite Gather with a constant single index to Slice (+ Squeeze)
+5) Replace Cast nodes whose input/output types match by Identity
+
+export_sat_hmr_onnx.py --apply-runtime-fix runs the same passes via apply_fix_passes().
 """
 
 from __future__ import annotations
@@ -18,10 +22,14 @@ from onnx import helper, numpy_helper, shape_inference
 from onnx import TensorProto
 
 
-def _shape_map(model: onnx.ModelProto) -> dict[str, list[int | str]]:
+def _inferred_values(model: onnx.ModelProto) -> list[onnx.ValueInfoProto]:
     inferred = shape_inference.infer_shapes(model)
+    return list(inferred.graph.value_info) + list(inferred.graph.input) + list(inferred.graph.output)
+
+
+def _shape_map(model: onnx.ModelProto) -> dict[str, list[int | str]]:
     out: dict[str, list[int | str]] = {}
-    for v in list(inferred.graph.value_info) + list(inferred.graph.input) + list(inferred.graph.output):
+    for v in _inferred_values(model):
         t = v.type.tensor_type
         if not t.HasField("shape"):
             continue
@@ -38,9 +46,8 @@ def _shape_map(model: onnx.ModelProto) -> dict[str, list[int | str]]:
 
 
 def _type_map(model: onnx.ModelProto) -> dict[str, int]:
-    inferred = shape_inference.infer_shapes(model)
     out: dict[str, int] = {}
-    for v in list(inferred.graph.value_info) + list(inferred.graph.input) + list(inferred.graph.output):
+    for v in _inferred_values(model):
         t = v.type.tensor_type
         if not t.HasField("elem_type"):
             continue
@@ -287,36 +294,30 @@ def rewrite_const_single_index_gather(model: onnx.ModelProto) -> tuple[onnx.Mode
             ]
         )
 
-        # Scalar index (shape=[]) reduces rank by 1 in Gather, so append Squeeze after Slice.
-        if index_arr.ndim == 0:
+        def make_slice(output_name: str) -> onnx.NodeProto:
+            return helper.make_node(
+                "Slice",
+                inputs=[node.input[0], starts_name, ends_name, axes_name, steps_name],
+                outputs=[output_name],
+                name=f"{base}/Slice",
+            )
+
+        if index_arr.ndim != 0:
+            new_nodes.append(make_slice(node.output[0]))
+        else:
+            # Scalar index (shape=[]) reduces rank by 1 in Gather, so append Squeeze after Slice.
             slice_out = f"{node.output[0]}__gather2slice"
             squeeze_axes_name = f"__gather2slice_squeeze_axes_{idx}"
             new_inits.append(
                 numpy_helper.from_array(np.asarray([gather_axis], dtype=np.int64), name=squeeze_axes_name)
             )
-            new_nodes.append(
-                helper.make_node(
-                    "Slice",
-                    inputs=[node.input[0], starts_name, ends_name, axes_name, steps_name],
-                    outputs=[slice_out],
-                    name=f"{base}/Slice",
-                )
-            )
+            new_nodes.append(make_slice(slice_out))
             new_nodes.append(
                 helper.make_node(
                     "Squeeze",
                     inputs=[slice_out, squeeze_axes_name],
                     outputs=[node.output[0]],
                     name=f"{base}/Squeeze",
-                )
-            )
-        else:
-            new_nodes.append(
-                helper.make_node(
-                    "Slice",
-                    inputs=[node.input[0], starts_name, ends_name, axes_name, steps_name],
-                    outputs=[node.output[0]],
-                    name=f"{base}/Slice",
                 )
             )
         rewritten += 1
@@ -364,6 +365,42 @@ def rewrite_redundant_cast(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int
     return model, rewritten
 
 
+def apply_fix_passes(
+    model: onnx.ModelProto,
+    skip_bool_where_rewrite: bool = False,
+    skip_single_split_rewrite: bool = False,
+    skip_const_gather_rewrite: bool = False,
+    skip_redundant_cast_rewrite: bool = False,
+) -> tuple[onnx.ModelProto, dict[str, int]]:
+    """Run all passes in order. Returns (model, rewrite counts in summary order)."""
+    counts: dict[str, int] = {}
+    model, counts["where_broadcast"] = patch_where_broadcast(model)
+    counts["bool_where_rewrite"] = 0
+    if not skip_bool_where_rewrite:
+        model, counts["bool_where_rewrite"] = rewrite_problematic_bool_where(model)
+    counts["split1_rewrite"] = 0
+    if not skip_single_split_rewrite:
+        model, counts["split1_rewrite"] = rewrite_single_output_split(model)
+    counts["const_gather_rewrite"] = 0
+    if not skip_const_gather_rewrite:
+        model, counts["const_gather_rewrite"] = rewrite_const_single_index_gather(model)
+    counts["redundant_cast_rewrite"] = 0
+    if not skip_redundant_cast_rewrite:
+        model, counts["redundant_cast_rewrite"] = rewrite_redundant_cast(model)
+    return model, counts
+
+
+def check_and_save(model: onnx.ModelProto, out_path: Path) -> None:
+    # Validate quickly via ONNX checker + shape inference.
+    onnx.checker.check_model(model)
+    _ = shape_inference.infer_shapes(model)
+    onnx.save(model, str(out_path))
+
+
+def format_fix_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{name}={n}" for name, n in counts.items())
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fix ONNX Where broadcast for TensorRT parser.")
     p.add_argument("--in", dest="in_path", required=True, help="Input ONNX path")
@@ -398,32 +435,15 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     model = onnx.load(str(in_path))
-    model, n_where_broadcast = patch_where_broadcast(model)
-    n_bool_where = 0
-    n_split = 0
-    if not args.skip_bool_where_rewrite:
-        model, n_bool_where = rewrite_problematic_bool_where(model)
-    if not args.skip_single_split_rewrite:
-        model, n_split = rewrite_single_output_split(model)
-    n_const_gather = 0
-    if not args.skip_const_gather_rewrite:
-        model, n_const_gather = rewrite_const_single_index_gather(model)
-    n_redundant_cast = 0
-    if not args.skip_redundant_cast_rewrite:
-        model, n_redundant_cast = rewrite_redundant_cast(model)
-
-    # Validate quickly via ONNX checker + shape inference.
-    onnx.checker.check_model(model)
-    _ = shape_inference.infer_shapes(model)
-    onnx.save(model, str(out_path))
-    print(
-            "[DONE] Fix summary: "
-            f"where_broadcast={n_where_broadcast}, "
-            f"bool_where_rewrite={n_bool_where}, "
-            f"split1_rewrite={n_split}, "
-            f"const_gather_rewrite={n_const_gather}, "
-            f"redundant_cast_rewrite={n_redundant_cast}"
+    model, counts = apply_fix_passes(
+        model,
+        skip_bool_where_rewrite=args.skip_bool_where_rewrite,
+        skip_single_split_rewrite=args.skip_single_split_rewrite,
+        skip_const_gather_rewrite=args.skip_const_gather_rewrite,
+        skip_redundant_cast_rewrite=args.skip_redundant_cast_rewrite,
     )
+    check_and_save(model, out_path)
+    print(f"[DONE] Fix summary: {format_fix_counts(counts)}")
     print(f"[DONE] Output: {out_path}")
     return 0
 

@@ -21,13 +21,7 @@ from tools.sat_hmr_export_utils import (
     build_infer_model,
     resolve_device,
 )
-from tools.fix_onnx_where_broadcast import (
-    patch_where_broadcast,
-    rewrite_problematic_bool_where,
-    rewrite_const_single_index_gather,
-    rewrite_redundant_cast,
-    rewrite_single_output_split,
-)
+from tools.fix_onnx_where_broadcast import apply_fix_passes, check_and_save, format_fix_counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,8 +77,6 @@ def main() -> int:
     args = parse_args()
     if not args.enable_xformers:
         os.environ.setdefault("XFORMERS_DISABLED", "1")
-
-    # onnx is imported at module level for optional runtime-fix pass.
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,23 +141,9 @@ def main() -> int:
         fixed_out = Path(args.fixed_out) if args.fixed_out else out_path.with_name(f"{out_path.stem}_runtimefix.onnx")
         fixed_out.parent.mkdir(parents=True, exist_ok=True)
         print("[INFO] Applying runtime-fix passes...")
-        model_onnx = onnx.load(str(out_path))
-        model_onnx, n_where_broadcast = patch_where_broadcast(model_onnx)
-        model_onnx, n_bool_where = rewrite_problematic_bool_where(model_onnx)
-        model_onnx, n_split = rewrite_single_output_split(model_onnx)
-        model_onnx, n_const_gather = rewrite_const_single_index_gather(model_onnx)
-        model_onnx, n_redundant_cast = rewrite_redundant_cast(model_onnx)
-        onnx.checker.check_model(model_onnx)
-        _ = onnx.shape_inference.infer_shapes(model_onnx)
-        onnx.save(model_onnx, str(fixed_out))
-        print(
-            "[DONE] Runtime-fix summary: "
-            f"where_broadcast={n_where_broadcast}, "
-            f"bool_where_rewrite={n_bool_where}, "
-            f"split1_rewrite={n_split}, "
-            f"const_gather_rewrite={n_const_gather}, "
-            f"redundant_cast_rewrite={n_redundant_cast}"
-        )
+        model_onnx, counts = apply_fix_passes(onnx.load(str(out_path)))
+        check_and_save(model_onnx, fixed_out)
+        print(f"[DONE] Runtime-fix summary: {format_fix_counts(counts)}")
         print(f"[DONE] Fixed ONNX: {fixed_out.resolve()}")
     return 0
 

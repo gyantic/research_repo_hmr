@@ -60,6 +60,26 @@ def _percentile(arr: np.ndarray, q: float) -> float:
     return float(np.percentile(arr, q))
 
 
+def _mean(arr: np.ndarray) -> float:
+    return float(np.mean(arr)) if arr.size else float("nan")
+
+
+def _finite_column(data: List[dict], key: str) -> np.ndarray:
+    """One exportTimes field as float64, with missing / non-finite samples dropped."""
+    values = np.asarray([float(x.get(key, np.nan)) for x in data], dtype=np.float64)
+    return values[np.isfinite(values)]
+
+
+def _qps(mean_ms: float) -> float:
+    return (1000.0 / mean_ms) if np.isfinite(mean_ms) and mean_ms > 0 else float("nan")
+
+
+def _speedup_pct(base_ms: float, value_ms: float) -> float:
+    if np.isfinite(base_ms) and np.isfinite(value_ms) and value_ms > 0:
+        return ((base_ms / value_ms) - 1.0) * 100.0
+    return float("nan")
+
+
 def load_times_summary(times_path: Path) -> Dict[str, float]:
     data = json.loads(times_path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
@@ -67,20 +87,13 @@ def load_times_summary(times_path: Path) -> Dict[str, float]:
     if len(data) == 0:
         raise RuntimeError(f"No timing samples in exportTimes JSON: {times_path}")
 
-    lat = np.asarray([float(x.get("latencyMs", np.nan)) for x in data], dtype=np.float64)
-    comp = np.asarray([float(x.get("computeMs", np.nan)) for x in data], dtype=np.float64)
-    h2d = np.asarray([float(x.get("h2dMs", np.nan)) for x in data], dtype=np.float64)
-    d2h = np.asarray([float(x.get("d2hMs", np.nan)) for x in data], dtype=np.float64)
+    lat = _finite_column(data, "latencyMs")
+    comp = _finite_column(data, "computeMs")
+    h2d = _finite_column(data, "h2dMs")
+    d2h = _finite_column(data, "d2hMs")
 
-    lat = lat[np.isfinite(lat)]
-    comp = comp[np.isfinite(comp)]
-    h2d = h2d[np.isfinite(h2d)]
-    d2h = d2h[np.isfinite(d2h)]
-
-    lat_mean = float(np.mean(lat)) if lat.size else float("nan")
-    comp_mean = float(np.mean(comp)) if comp.size else float("nan")
-    h2d_mean = float(np.mean(h2d)) if h2d.size else float("nan")
-    d2h_mean = float(np.mean(d2h)) if d2h.size else float("nan")
+    lat_mean = _mean(lat)
+    comp_mean = _mean(comp)
 
     return {
         "samples": int(len(data)),
@@ -88,10 +101,10 @@ def load_times_summary(times_path: Path) -> Dict[str, float]:
         "lat_p95_ms": _percentile(lat, 95.0),
         "compute_mean_ms": comp_mean,
         "compute_p95_ms": _percentile(comp, 95.0),
-        "h2d_mean_ms": h2d_mean,
-        "d2h_mean_ms": d2h_mean,
-        "qps_from_lat": (1000.0 / lat_mean) if np.isfinite(lat_mean) and lat_mean > 0 else float("nan"),
-        "qps_from_compute": (1000.0 / comp_mean) if np.isfinite(comp_mean) and comp_mean > 0 else float("nan"),
+        "h2d_mean_ms": _mean(h2d),
+        "d2h_mean_ms": _mean(d2h),
+        "qps_from_lat": _qps(lat_mean),
+        "qps_from_compute": _qps(comp_mean),
     }
 
 
@@ -158,33 +171,23 @@ def main() -> int:
             iterations=args.iterations,
             extra_args=args.extra_arg,
         )
-        summary = load_times_summary(times_path)
-        row: Dict[str, object] = {
+        rows.append({
             "engine": label,
             "engine_path": str(engine_path),
             "times_json": str(times_path),
-            **summary,
-        }
-        rows.append(row)
+            **load_times_summary(times_path),
+        })
 
     if not rows:
         print("[ERROR] no benchmark rows")
         return 2
 
-    base = rows[0]
-    base_lat = float(base["lat_mean_ms"])
-    base_comp = float(base["compute_mean_ms"])
+    # The first --engine is the baseline.
+    base_lat = float(rows[0]["lat_mean_ms"])
+    base_comp = float(rows[0]["compute_mean_ms"])
     for row in rows:
-        lat = float(row["lat_mean_ms"])
-        comp = float(row["compute_mean_ms"])
-        row["speedup_vs_base_pct_lat"] = (
-            ((base_lat / lat) - 1.0) * 100.0 if np.isfinite(base_lat) and np.isfinite(lat) and lat > 0 else float("nan")
-        )
-        row["speedup_vs_base_pct_compute"] = (
-            ((base_comp / comp) - 1.0) * 100.0
-            if np.isfinite(base_comp) and np.isfinite(comp) and comp > 0
-            else float("nan")
-        )
+        row["speedup_vs_base_pct_lat"] = _speedup_pct(base_lat, float(row["lat_mean_ms"]))
+        row["speedup_vs_base_pct_compute"] = _speedup_pct(base_comp, float(row["compute_mean_ms"]))
 
     fieldnames = [
         "engine",

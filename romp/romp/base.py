@@ -26,8 +26,6 @@ from visualization.visualization import Visualizer
 if args().model_precision=='fp16':
     from torch.cuda.amp import autocast, GradScaler
 
-TORCHAO_INT8_BACKBONE_QUANTIZATION = 'torchao_intx_weight_only_int8'  # meta tag written by tools/export_torchao_int8_backbone_romp.py
-
 def _is_torchao_int8_weight_only_target(module, fqn, scope='full'):
     """Select Conv2d/Linear layers for int8 weight-only quantization; scope 'backbone' limits it to model.backbone."""
     if not (isinstance(module, (nn.Conv2d, nn.Linear)) and hasattr(module, 'weight')):
@@ -52,22 +50,6 @@ class Base(object):
         model = build_model()
         if self.fine_tune or self.eval:
             drop_prefix = ''
-            # A checkpoint exported with an int8-quantized backbone stores torchao tensors,
-            # so the backbone must be quantized the same way *before* load_model copies them in.
-            pre_quantized_backbone_int8 = False
-            if os.path.exists(self.model_path):
-                ckpt = torch.load(self.model_path, map_location='cpu', weights_only=False)
-                ckpt_meta = ckpt.get('meta', {}) if isinstance(ckpt, dict) else {}
-                if (ckpt_meta.get('quantization') == TORCHAO_INT8_BACKBONE_QUANTIZATION
-                        and ckpt_meta.get('scope') == 'backbone'):
-                    pre_quantized_backbone_int8 = True
-                    logging.info('[int8] Detected pre-quantized backbone checkpoint; pre-applying quantize_() before load.')
-            if pre_quantized_backbone_int8:
-                model = model.cuda()
-                from torchao.quantization import quantize_, IntxWeightOnlyConfig
-                quantize_(model.backbone,
-                          IntxWeightOnlyConfig(weight_dtype=torch.int8),
-                          filter_fn=lambda mod, fqn: _is_torchao_int8_weight_only_target(mod, fqn, scope='full'))
             if self.model_version==6:
                 model = load_model(self.model_path, model, prefix = 'module.', drop_prefix=drop_prefix, fix_loaded=True)
             else:

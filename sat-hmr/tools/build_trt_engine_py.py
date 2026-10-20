@@ -93,27 +93,19 @@ def main() -> int:
         config.set_flag(trt.BuilderFlag.EXCLUDE_LEAN_RUNTIME)
 
     shapes = parse_shape_spec(args.shapes)
-    has_dynamic = False
-    for i in range(network.num_inputs):
-        t = network.get_input(i)
-        if any(int(d) < 0 for d in t.shape):
-            has_dynamic = True
-            break
-
-    if has_dynamic:
+    inputs = [network.get_input(i) for i in range(network.num_inputs)]
+    if any(int(d) < 0 for t in inputs for d in t.shape):
+        # Every input gets a fixed (min = opt = max) shape: --shapes for the dynamic ones.
         profile = builder.create_optimization_profile()
-        for i in range(network.num_inputs):
-            t = network.get_input(i)
+        for t in inputs:
             shape = tuple(int(d) for d in t.shape)
             if any(d < 0 for d in shape):
                 if t.name not in shapes:
                     raise RuntimeError(
                         f"Dynamic input {t.name} shape {shape} requires --shapes override"
                     )
-                s = shapes[t.name]
-                profile.set_shape(t.name, s, s, s)
-            else:
-                profile.set_shape(t.name, shape, shape, shape)
+                shape = shapes[t.name]
+            profile.set_shape(t.name, shape, shape, shape)
         config.add_optimization_profile(profile)
 
     print(f"[INFO] TensorRT Python: {trt.__version__}")

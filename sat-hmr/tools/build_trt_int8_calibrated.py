@@ -4,17 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
 import numpy as np
 
-from calib_image_utils import (
-    preprocess_calibration_image,
-    resolve_manifest_path,
-    unique_paths,
-)
+from calib_image_utils import collect_calibration_images, preprocess_calibration_image
 
 
 def cuda_call(ret, name: str):
@@ -52,53 +47,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_manifest_images(manifest_path: Path) -> List[Path]:
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
-    images: List[Path] = []
-    with manifest_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            raise RuntimeError(f"Invalid manifest (no header): {manifest_path}")
-
-        for row in reader:
-            image_path = row.get("image_path", "").strip()
-            if not image_path:
-                vals = list(row.values())
-                image_path = vals[1].strip() if len(vals) >= 2 and vals[1] else ""
-            if not image_path:
-                continue
-            resolved = resolve_manifest_path(image_path, manifest_path)
-            if resolved.is_file():
-                images.append(resolved)
-
-    if not images:
-        raise RuntimeError(f"No valid images found in manifest: {manifest_path}")
-    return images
-
-
-def load_dir_images(calib_dir: Path) -> List[Path]:
-    if not calib_dir.is_dir():
-        raise FileNotFoundError(f"Calibration directory not found: {calib_dir}")
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
-    images: List[Path] = []
-    for ext in exts:
-        images.extend(sorted(calib_dir.glob(ext)))
-    if not images:
-        raise RuntimeError(f"No images found in directory: {calib_dir}")
-    return images
-
-
-def collect_calibration_images(args: argparse.Namespace) -> List[Path]:
-    images: List[Path] = []
-    if args.calib_manifest:
-        images.extend(load_manifest_images(Path(args.calib_manifest)))
-    if args.calib_dir:
-        images.extend(load_dir_images(Path(args.calib_dir)))
-    images = unique_paths(images)
-    if args.max_images > 0:
-        images = images[: args.max_images]
+def load_calibration_images(args: argparse.Namespace) -> List[Path]:
+    # Unlike quantize_onnx_qdq_ptq.py, an empty manifest or directory is an error here.
+    images = collect_calibration_images(
+        args.calib_manifest, args.calib_dir, args.max_images, require_images_per_source=True
+    )
     if not images:
         raise RuntimeError("No calibration images provided. Use --calib_manifest and/or --calib_dir")
     return images
@@ -162,7 +115,7 @@ def build_engine(args: argparse.Namespace) -> int:
     engine_out.parent.mkdir(parents=True, exist_ok=True)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    images = collect_calibration_images(args)
+    images = load_calibration_images(args)
     if args.batch_size < 1:
         print("[ERROR] --batch_size must be >= 1")
         return 2

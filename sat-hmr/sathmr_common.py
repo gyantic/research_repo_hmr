@@ -1,6 +1,6 @@
 """Helpers shared by the SAT-HMR demo / benchmark scripts.
 
-Used by video_demo*.py, webcam_demo*.py, sathmr_{tcp,udp}_benchmark.py and
+Used by video_demo.py, video_demo_trt.py, webcam_demo_trt.py and
 engines/engine.py (and, through video_demo.py, by ue/infer_sequential.py).
 
 Only dependencies that every one of those scripts already imports are loaded
@@ -11,6 +11,8 @@ the TensorRT runner lives in trt_runner.py and imports them lazily.
 import math
 import os
 import random
+import socket
+import time
 from typing import Tuple
 
 import cv2
@@ -201,7 +203,6 @@ def setup_render_imports(no_render: bool):
         return True, None
 
     try:
-        # Keep same workaround order as webcam_demo.py
         os.environ.setdefault('PYOPENGL_PLATFORM', 'pyglet')
         import pyrender  # noqa: F401
 
@@ -305,36 +306,260 @@ def select_udp_target(cands, tracker_state, max_dist_cm, reinit_conf):
     return selected, tracker_state, reason
 
 
-# ---------------------------------------------------------------------------
-# Single-person inference used by sathmr_{tcp,udp}_benchmark.py
-# ---------------------------------------------------------------------------
-
-def infer_frame(model, frame, input_size, conf_thresh, device):
-    """Run one frame and return the SMPL parameters of the most confident person."""
-    img_tensor, img_size, _orig_size = preprocess_frame(frame, input_size, use_sat=True)
-    img_tensor = img_tensor.to(device)
-
-    targets = [{
-        'img_size': torch.tensor(img_size).to(device),
-        'img_path': 'video_frame'
-    }]
-
-    with torch.no_grad():
-        outputs = model([img_tensor], targets)
-
-    idx = 0
-    confs = outputs['pred_confs'][idx].squeeze(-1)
-    select_idx = torch.where(confs > conf_thresh)[0]
-
-    if len(select_idx) == 0:
-        return {'detection_flag': False}
-
-    best_idx = select_idx[confs[select_idx].argmax()]
-
+def empty_udp_candidates():
+    """select_udp_target() candidates for a frame with no detection."""
     return {
-        'detection_flag': True,
-        'pose': outputs['pred_poses'][idx][best_idx].detach().cpu().numpy(),
-        'betas': outputs['pred_betas'][idx][best_idx].detach().cpu().numpy(),
-        'transl': outputs['pred_transl'][idx][best_idx].detach().cpu().numpy(),
-        'conf': confs[best_idx].detach().cpu().item(),
+        'poses': np.empty((0, 72), dtype=np.float32),
+        'transls': np.empty((0, 3), dtype=np.float32),
+        'confs': np.empty((0,), dtype=np.float32),
+        'query_ids': np.empty((0,), dtype=np.int32),
     }
+
+
+def make_udp_candidates(poses, transls, confs, select_idx):
+    """select_udp_target() candidates. confs covers every query; select_idx are the detected ones."""
+    return {
+        'poses': poses,
+        'transls': transls,
+        'confs': confs[select_idx].astype(np.float32),
+        'query_ids': select_idx.astype(np.int32),
+    }
+
+
+# ---------------------------------------------------------------------------
+# UDP streaming to UE (video_demo_trt.py / webcam_demo_trt.py)
+# ---------------------------------------------------------------------------
+
+def add_udp_args(parser):
+    """Add the --udp / --ue_port / --local_port / --udp_* options used by UdpPoseStreamer."""
+    parser.add_argument('--udp', action='store_true', help='Enable UDP send to UE')
+    parser.add_argument('--ue_port', type=int, default=62004, help='UE receive port')
+    parser.add_argument('--local_port', type=int, default=5555, help='Local bind port for HELLO')
+
+    parser.add_argument('--udp_track_max_dist_cm', type=float, default=120.0)
+    parser.add_argument('--udp_reinit_conf', type=float, default=0.55)
+    parser.add_argument('--udp_hold_frames', type=int, default=10)
+    parser.add_argument('--udp_trans_jump_cm', type=float, default=30.0)
+    parser.add_argument('--udp_outlier_mode', choices=['skip', 'clamp'], default='skip')
+    parser.add_argument('--udp_outlier_max_skip', type=int, default=12)
+    parser.add_argument('--udp_jump_conf_thresh', type=float, default=0.35)
+    parser.add_argument('--udp_jump_motion_cm', type=float, default=20.0)
+    parser.add_argument('--udp_jump_pose_motion', type=float, default=0.02)
+    parser.add_argument('--udp_jump_debounce', type=int, default=2)
+    parser.add_argument('--udp_jump_hold_frames', type=int, default=4)
+    parser.add_argument('--udp_jump_cooldown', type=int, default=6)
+
+
+def print_udp_settings(args):
+    print(f'UDP送信: ON (local:{args.local_port} -> ue:{args.ue_port})')
+    if args.udp_trans_jump_cm > 0:
+        print(
+            f'外れ値抑制: ON (mode={args.udp_outlier_mode}, '
+            f'trans_jump_cm={args.udp_trans_jump_cm:.1f}, max_skip={args.udp_outlier_max_skip})'
+        )
+    else:
+        print('外れ値抑制: OFF')
+    print(
+        'ジャンプ例外: '
+        f'conf>={args.udp_jump_conf_thresh:.2f}, '
+        f'motion>={args.udp_jump_motion_cm:.1f}cm or '
+        f'pose>={args.udp_jump_pose_motion:.4f}, '
+        f'debounce={args.udp_jump_debounce}, '
+        f'hold={args.udp_jump_hold_frames}, cooldown={args.udp_jump_cooldown}'
+    )
+
+
+class UdpPoseStreamer:
+    """Send one tracked person per frame to UE as an ASCII '<quaternions>|<translation>' line.
+
+    A translation step larger than --udp_trans_jump_cm is treated as a detection
+    outlier and skipped or clamped. A confident, sustained large motion is instead
+    accepted as a real jump: it opens a "jump hold" window that bypasses outlier
+    suppression, followed by a cooldown before another jump can be detected.
+    """
+
+    LOG_EVERY_N_FRAMES = 30
+
+    def __init__(self, args):
+        self.args = args
+        self.sock = None
+        self.ue_addr = None
+        self.connected_at = None
+        self.first_send_done = False
+
+        self.prev_quat = None
+        self.prev_trans = None
+        self.outlier_skip_streak = 0
+        self.jump_candidate_streak = 0
+        self.jump_hold_left = 0
+        self.jump_cooldown_left = 0
+        self.tracker_state = {
+            'active': False,
+            'transl': None,
+            'query_id': None,
+            'missed': 0,
+        }
+
+    def wait_for_hello(self):
+        """Bind the local port and block until UE sends HELLO; its host becomes the destination."""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('0.0.0.0', self.args.local_port))
+        print(f'[WAIT] HELLO on 0.0.0.0:{self.args.local_port}')
+        _, addr = self.sock.recvfrom(2048)
+        self.ue_addr = (addr[0], self.args.ue_port)
+        print(f'[HELLO] from {addr} -> dst={self.ue_addr}')
+        self.connected_at = time.perf_counter()
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+
+    def process(self, frame_count, num_persons, candidates):
+        """Track, filter and (maybe) send one frame. Must be called once per frame."""
+        args = self.args
+        log_this_frame = frame_count % self.LOG_EVERY_N_FRAMES == 0
+        self._tick_jump_timers()
+
+        target, self.tracker_state, track_reason = select_udp_target(
+            candidates,
+            self.tracker_state,
+            args.udp_track_max_dist_cm,
+            args.udp_reinit_conf,
+        )
+        if target is None:
+            self._on_target_missing()
+            if log_this_frame:
+                print(f'UDP frame={frame_count} skip ({track_reason}) persons={num_persons}')
+            return
+
+        quaternions = smpl_pose_to_ue_quaternions(target['pose'])
+        trans = transl_to_ue(target['transl'])
+        if not (np.isfinite(quaternions).all() and np.isfinite(trans).all()):
+            if log_this_frame:
+                print(f'UDP frame={frame_count} skip (invalid payload) persons={num_persons}')
+            return
+
+        raw_trans_motion = 0.0 if self.prev_trans is None else float(np.linalg.norm(trans - self.prev_trans))
+        raw_pose_motion = 0.0 if self.prev_quat is None else float(np.mean(np.abs(quaternions - self.prev_quat)))
+
+        self._update_jump_detection(target['conf'], raw_trans_motion, raw_pose_motion)
+        jump_armed = self.jump_hold_left > 0
+        if jump_armed:
+            self.outlier_skip_streak = 0
+            send_trans, skip_send = trans.copy(), False
+            outlier_note = f' jump_bypass(hold={self.jump_hold_left})'
+        else:
+            send_trans, skip_send, outlier_note = self._suppress_trans_outlier(trans, raw_trans_motion)
+
+        if skip_send:
+            if log_this_frame:
+                print(f'UDP frame={frame_count} skip ({outlier_note}) persons={num_persons}')
+            return
+
+        sent = self._send(quaternions, send_trans)
+
+        if self.prev_quat is None:
+            pose_motion = 0.0
+            trans_motion = 0.0
+        else:
+            pose_motion = raw_pose_motion
+            trans_motion = float(np.linalg.norm(send_trans - self.prev_trans))
+
+        self.prev_quat = quaternions.copy()
+        self.prev_trans = send_trans.copy()
+
+        # The last frame of a jump hold starts the cooldown.
+        if jump_armed and self.jump_hold_left == 1:
+            self.jump_cooldown_left = max(0, args.udp_jump_cooldown)
+
+        if log_this_frame:
+            print(
+                f'UDP frame={frame_count} conf={target["conf"]:.3f} '
+                f'persons={target["num_persons"]} query={target["query_id"]} '
+                f'reason={track_reason} pose_motion={pose_motion:.5f} '
+                f'trans_motion={trans_motion:.2f}{outlier_note} sent={sent}'
+            )
+
+    def _tick_jump_timers(self):
+        if self.jump_cooldown_left > 0:
+            self.jump_cooldown_left -= 1
+        if self.jump_hold_left > 0:
+            self.jump_hold_left -= 1
+
+    def _on_target_missing(self):
+        self.outlier_skip_streak = 0
+        self.jump_candidate_streak = 0
+        self.tracker_state['missed'] += 1
+        if self.tracker_state['missed'] > self.args.udp_hold_frames:
+            self.tracker_state['active'] = False
+            self.tracker_state['transl'] = None
+            self.tracker_state['query_id'] = None
+
+    def _update_jump_detection(self, conf, raw_trans_motion, raw_pose_motion):
+        """Open the jump hold once a jump-like motion has lasted --udp_jump_debounce frames."""
+        args = self.args
+        if self.prev_trans is None or self.jump_cooldown_left != 0:
+            self.jump_candidate_streak = 0
+            return
+
+        looks_like_jump = (
+            conf >= args.udp_jump_conf_thresh and
+            (
+                raw_trans_motion >= args.udp_jump_motion_cm or
+                raw_pose_motion >= args.udp_jump_pose_motion
+            )
+        )
+        if not looks_like_jump:
+            self.jump_candidate_streak = 0
+            return
+
+        self.jump_candidate_streak += 1
+        if self.jump_candidate_streak >= max(1, args.udp_jump_debounce):
+            self.jump_hold_left = max(self.jump_hold_left, args.udp_jump_hold_frames)
+            self.jump_candidate_streak = 0
+
+    def _suppress_trans_outlier(self, trans, raw_trans_motion):
+        """Returns (send_trans, skip_send, outlier_note)."""
+        args = self.args
+        is_outlier = (
+            self.prev_trans is not None and
+            args.udp_trans_jump_cm > 0 and
+            raw_trans_motion > args.udp_trans_jump_cm
+        )
+        if not is_outlier:
+            self.outlier_skip_streak = 0
+            return trans.copy(), False, ''
+
+        if args.udp_outlier_mode != 'skip':
+            # clamp: move at most udp_trans_jump_cm towards the new position.
+            delta = trans - self.prev_trans
+            scale = args.udp_trans_jump_cm / (raw_trans_motion + 1e-9)
+            note = f' outlier=clamp({raw_trans_motion:.2f}->{args.udp_trans_jump_cm:.2f}cm)'
+            self.outlier_skip_streak = 0
+            return self.prev_trans + delta * scale, False, note
+
+        self.outlier_skip_streak += 1
+        if self.outlier_skip_streak <= args.udp_outlier_max_skip:
+            note = (
+                f'trans_outlier {raw_trans_motion:.2f}>{args.udp_trans_jump_cm:.2f}cm '
+                f'(skip {self.outlier_skip_streak}/{args.udp_outlier_max_skip})'
+            )
+            return trans.copy(), True, note
+
+        # Skipped too long: accept the new position as the new baseline.
+        note = f' outlier=rebase({raw_trans_motion:.2f}cm after {self.outlier_skip_streak} skips)'
+        self.outlier_skip_streak = 0
+        return trans.copy(), False, note
+
+    def _send(self, quaternions, trans):
+        pose_str = ','.join(f'{v:.4f}' for v in quaternions.flatten())
+        trans_str = ','.join(f'{v:.4f}' for v in trans.flatten())
+        payload = f'{pose_str}|{trans_str}\n'.encode('ascii')
+        sent = self.sock.sendto(payload, self.ue_addr)
+
+        if not self.first_send_done:
+            startup_lag = time.perf_counter() - self.connected_at
+            print(f'[INFO] Startup Lag: {startup_lag:.4f} seconds')
+            self.first_send_done = True
+        return sent

@@ -4,10 +4,8 @@
 元のリポジトリの README は [README_UPSTREAM.md](README_UPSTREAM.md) に保存。
 
 ## 主な独自追加
-- `romp/generator_bonebasedMesh.py` — SMPL pose を関節クォータニオンへ変換し **TCP** で Unreal Engine へ送信。推論時間の統計 CSV も出力。
-- `romp/generator_bonebasedMesh_UDPver.py` — 上記の **UDP** 版（ffmpeg で 12 fps に揃えて入力）。
 - `romp_video_demo.py` — 動画入力のベンチマーク用デモ（`--metrics_csv` で per-frame 速度を出力）。論文の ROMP 速度評価で使用。
-- `tools/export_torchao_int8_backbone_romp.py` / `export_quantized_weights_romp.py` — int8 量子化重みのエクスポート。
+- `tools/export_quantized_weights_romp.py` — 量子化重みのエクスポート。
 
 ## 環境
 conda 環境ファイル [environment.yml](environment.yml)（env 名 `romp_3.9`）を同梱。

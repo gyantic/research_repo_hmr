@@ -4,11 +4,10 @@
 元のリポジトリの README は [README_UPSTREAM.md](README_UPSTREAM.md) に保存。
 
 ## 主な独自追加
-- **デモ／UE 連携**: `video_demo.py`（Torch 基準・SMPL 姿勢を UE へ UDP 送信＋描画）、`video_demo_onnx.py`（ONNX Runtime）、`video_demo_trt.py`（TensorRT）、`webcam_demo.py` / `webcam_demo_trt.py`（Web カメラ実時間）。
-- **速度ベンチ**: `sathmr_tcp_benchmark.py` / `sathmr_udp_benchmark.py`。
-- **int8 量子化中核**: `models/int8_attention.py` `static_int8_fused.py`（`grouped_linear.py` `triton_grouped_int8.py` は `tools/benchmark_grouped_bbox_int8.py` 用）。
+- **デモ／UE 連携**: `video_demo.py`（Torch 基準・SMPL 姿勢を UE へ UDP 送信＋描画）、`video_demo_trt.py`（TensorRT）、`webcam_demo_trt.py`（Web カメラ実時間・TensorRT）。
+- **int8 量子化中核**: `models/int8_attention.py` `static_int8_fused.py`。
 - **共通ヘルパー**: `sathmr_common.py`（前処理・SMPL→UE 変換・UDP 追跡などデモ／ベンチマーク共通）、`trt_runner.py`（TensorRT 実行）。
-- **ツール群** `tools/`（量子化・TensorRT/ONNX エクスポート・キャリブレーション・3DPW 評価・transport ベンチ 等）と一括実行 `run_*.sh`。
+- **ツール群** `tools/`（量子化・TensorRT/ONNX エクスポート・キャリブレーション・TensorRT での 3DPW 評価）。
 - **設定**: `configs/run/eval_3dpw_*.yaml`・`train_qat.yaml`。
 
 ## 環境

@@ -2,7 +2,7 @@
 
 SAM3D_QUIET=1 (set by run_publisher_ue.py) suppresses the per-frame timing and
 debug prints so they do not perturb real-time latency. The flag is read once at
-import; scripts may toggle ``QUIET`` at runtime (see profile_components.py).
+import; scripts may toggle ``QUIET`` at runtime.
 """
 
 import os

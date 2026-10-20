@@ -18,6 +18,8 @@ measurements/
     convert_weights_bf16.py    bf16 重みの作成とサイズの集計（Table 2）
   run_all.sh                   すべての計測・評価を実行して paper_results.csv を作る
   make_paper_results.py        計測・評価の出力から paper_results.csv を作る
+  cmu_panoptic/
+    make_person_clips.py       図4・UEのデモの CMU Panoptic Studio のクリップを切り出す
   summarize_speed.py           生データから推論時間の中央値・MAD を出す
   paper_figures/               論文の図の生成
 ```
@@ -50,10 +52,8 @@ python measurements/paper_figures/plot_udp_overhead.py
 
 | データ | 置き場所 | 用意の方法 |
 |---|---|---|
-| 速度計測の入力動画（1280×720・約30 fps・528フレーム。3モデル共通。Fast-SAM-3D-Body の INT8 較正にも使用） | `datasets/videos/sample_video.mp4` | [動画ACの素材ページ](https://video-ac.com/video/1201)から HD サイズ（1280×720）をダウンロードし、`sample_video.mp4` として配置します（固定カメラ・単一人物の実写動画）。 |
+| 速度計測の入力動画（1280×720・約30 fps・528フレーム。3モデル共通。） | `datasets/videos/sample_video.mp4` | [動画ACの素材ページ](https://video-ac.com/video/1201)から HD サイズ（1280×720）をダウンロードし、`sample_video.mp4` として配置します（固定カメラ・単一人物の実写動画）。 |
 | 3DPW | `datasets/3dpw/` | ルートREADMEの[3DPWの配置](../README.md#3dpwの配置)を参照してください。 |
-| CMU Panoptic Studio の動画（図4・UEのデモ） | `datasets/cmu_panoptic/person_clips/` | 下記のシーケンスを使用しました。 |
-
-CMU Panoptic Studio の動画は、シーケンス `171026_pose1`・`171204_pose2`・`171204_pose3`・`171204_pose4`・`171204_pose5` の HD 映像（カメラ `hd_00_00`）を使用しました。
+| CMU Panoptic Studio の動画（図4・UEのデモ） | `datasets/cmu_panoptic/person_clips/` | ルートREADMEの[CMU Panoptic Studioの動画の配置](../README.md#cmu-panoptic-studioの動画の配置)を参照してください。 |
 
 UEパッケージの起動方法は [ue/README.md](../ue/README.md) を参照してください。
