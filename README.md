@@ -101,8 +101,7 @@ conda env create -f sat-hmr/environment.yml           # 環境名 sathmr-copy
 conda env create -f fast-sam-3d-body/environment.yml  # 環境名 sam_3d_body
 ```
 
-`romp_3.9` には pytorch3d を、`sathmr-copy`・`sam_3d_body` には chumpy（SMPLの読み込みに使用）を別に入れます。どちらも通常のpipのビルドでは入らないため `--no-build-isolation` を付けます。`sam_3d_body` には、さらに detectron2 を指定のコミットから入れます。pytorch3d はソースからビルドするため、CUDA 11.8 の `nvcc` が必要です（ビルドに10分以上かかります）。
-
+`romp_3.9` には pytorch3d を、`sathmr-copy`・`sam_3d_body` には chumpy（SMPLの読み込みに使用）を別に入れます。いずれも通常のpipビルドではエラーになるため、--no-build-isolation オプションを付与してインストールしてください。
 ```bash
 conda activate romp_3.9
 CUDA_HOME=/usr/local/cuda-11.8 FORCE_CUDA=1 python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@0a59450f0ebbe12d9a8db3de937814932517633b"
@@ -115,7 +114,7 @@ python -m pip install --no-build-isolation chumpy==0.70
 python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/detectron2.git@a1ce2f956a1d2212ad672e3c47d53405c2fe4312"
 ```
 
-chumpyにはPython 3.11・NumPyとの互換修正が必要です。両方の環境に[互換修正手順](sat-hmr/docs/fix_chumpy.md)を適用します。
+※ chumpy を Python 3.11 および新しい NumPy 環境で動作させるには、互換性のためのパッチ適用（修正手順）が必要です。sathmr-copy と sam_3d_body の両環境に[互換修正手順](sat-hmr/docs/fix_chumpy.md)を適用してください。
 
 ### モデルの取得と配置
 
@@ -128,7 +127,7 @@ chumpyにはPython 3.11・NumPyとの互換修正が必要です。両方の環�
 | SMPL補助データ | [SAT-HMR公式のGoogle Drive](https://drive.google.com/drive/folders/1wmd_pjmmDn3eSl3TLgProgZgCQZgtZIC?usp=sharing) | 同フォルダに `smpl_mean_params.npz`、`body_verts_smpl.npy`、`J_regressor_h36m_correct.npy` |
 | MoGe-2 ViT-S normal `model.pt` | [MoGe公式モデル配布](https://huggingface.co/Ruicheng/moge-2-vits-normal/tree/main) | `checkpoints/moge2/model.pt` |
 
-SMPLは各公式サイトからダウンロードし、次のように名前を変えて置きます。
+SMPLモデルファイルは、各公式サイトからダウンロードした後に以下のとおりリネームして配置してください。
 
 | ダウンロードしたファイル | 配置するファイル名 |
 |---|---|
@@ -145,7 +144,7 @@ mv /path/to/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl body_models/smpl/SMPL_NEU
 
 ### 量子化などで作成した重みの取得
 
-論文で使用したbf16・INT8の重みとTensorRTエンジンは、リポジトリのルートで次を実行すると、各モデルが読み込む場所に配置されます。自分で作成する場合は[計測用の重みの作成](#計測用の重みの作成)を参照してください。
+論文で使用したbf16・INT8の重みとTensorRTエンジンは [Hugging Face](https://huggingface.co/kimurakmkm123/research_repo_hmr) で配布しています。リポジトリのルートで次を実行すると、各モデルが読み込む場所に配置されます。自分で作成する場合は[計測用の重みの作成](#計測用の重みの作成)を参照してください。
 
 ```bash
 python download_weights.py            # 全モデル
@@ -314,7 +313,8 @@ python -c 'import torch, chumpy; from moge.model.v2 import MoGeModel; assert tor
 
 ### UEパッケージの作成
 
-演出ごとのUEパッケージ（Normal：衣装の重畳、RockDrop：落下する岩、SphereOrbit：周囲を回る球）を作ります。パッケージにはSMPLの人体とSocketClientプラグインが入るため配布しておらず、GitHub Releasesで配布しているUEプロジェクトから各自で作成します。
+3種類の演出用UEパッケージ（Normal：衣装の重畳、RockDrop：落下する岩、SphereOrbit：周囲を回る球）をビルドします。
+※ パッケージにはSMPLの人体データと有料のSocketClientプラグインが含まれるため、ビルド済みバイナリは配布していません。GitHub Releasesで配布しているUEプロジェクトから各自でビルドしてください。
 
 必要なもの：
 
