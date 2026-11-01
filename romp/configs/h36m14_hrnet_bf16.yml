@@ -1,6 +1,6 @@
 ARGS:
  tab: 'pw3d_test'
- eval_dataset: 'pw3d_normal'
+ eval_dataset: 'pw3d_test'
  save_visualization_on_img: False
  GPUS: 0
  model_version: 1
@@ -18,5 +18,5 @@ ARGS:
  model_precision: 'bf16'
  smpl_mesh_root_align: True
 
- model_path: trained_models/ROMP_HRNet32_V1.pkl
+ model_path: trained_models/ROMP_HRNet32_V1_bf16.pth
  dataset_rootdir: '../datasets'

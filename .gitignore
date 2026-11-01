@@ -1,6 +1,6 @@
 # === 重み / データセット / 学習資産 ===
 weights/
-datasets/
+/datasets/
 datas/
 # checkpoints はDLした重み置き場 → 原則除外。ただしユーザー改変のconfig/docは残す
 # （先頭に **/ を付けないとリポジトリ直下の checkpoints/ にしか効かない）
@@ -13,7 +13,7 @@ datas/
 !**/checkpoints/**/LICENSE
 trained_models/
 model_data/
-data/
+/data/
 smpl/
 /body_models/
 outputs/

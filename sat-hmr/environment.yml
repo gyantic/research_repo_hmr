@@ -156,7 +156,6 @@ dependencies:
       - accelerate==1.10.0
       - anyio==4.12.0
       - bitsandbytes==0.49.2
-      - chumpy==0.70
       - click==8.3.1
       - contourpy==1.3.3
       - cuda-python==12.6.2

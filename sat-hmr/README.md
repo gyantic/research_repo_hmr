@@ -15,7 +15,8 @@ conda 環境ファイル [environment.yml](environment.yml)（env 名 `sathmr-co
 作成: `conda env create -f environment.yml` → `conda activate sathmr-copy`。
 
 ## 実行の準備
-- SAT-HMR 重み（例 `weights/sat_hmr/sat_644*.pth`）・DINOv2 系バックボーン・データセット（3DPW 等）。元のリポジトリの手順で取得し配置。
+- SAT-HMR 重み `weights/sat_hmr/sat_644.pth`・`sat_644_3dpw.pth`・DINOv2 系バックボーン・データセット（3DPW 等）。元のリポジトリの手順で取得し配置。
+- bf16・INT8 の重み（`sat_644_bf16.pth`・`sat_644_int8w.pth`・`sat_644_3dpw_int8w.pth`）は、リポジトリのルートで `python download_weights.py sathmr` を実行して取得（手順はルート README）。
 - 論文の SAT-HMR 速度/精度は `video_demo.py` で計測。
 
 ## 動画推論

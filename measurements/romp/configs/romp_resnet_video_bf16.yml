@@ -9,7 +9,7 @@ ARGS:
  torchao_int8_scope: 'backbone'
  val_batch_size: 1
  nw: 1
- model_path: trained_models/ROMP_ResNet50_V1.pkl
+ model_path: trained_models/ROMP_ResNet50_V1_bf16.pth
 
  smpl_mesh_root_align: False
  centermap_conf_thresh: 0.25

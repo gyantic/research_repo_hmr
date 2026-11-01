@@ -1,6 +1,6 @@
 ARGS:
  tab: 'pw3d_test'
- eval_dataset: 'pw3d_normal'
+ eval_dataset: 'pw3d_test'
  GPUS: 0
  model_version: 1
  

@@ -14,7 +14,8 @@ conda 環境ファイル [environment.yml](environment.yml)（env 名 `sam_3d_bo
 作成: `conda env create -f environment.yml` → `conda activate sam_3d_body`。
 
 ## 実行の準備
-- `checkpoints/`（SAM-3D-Body / DINOv3 / MoGe / YOLO 重み・TensorRT エンジン）、MHR モデル、3DPW データ。公式配布元から取得し配置。
+- `checkpoints/`（SAM-3D-Body / DINOv3 / MoGe / YOLO 重み）、MHR モデル、3DPW データ。公式配布元から取得し配置。
+- 論文で使用した TensorRT エンジンと bf16 の重みは、リポジトリのルートで `python download_weights.py fastsam` を実行して取得（手順はルート README）。GPU・TensorRT のバージョンが異なる場合は、下の[TensorRTエンジンの作成](#tensorrtエンジンの作成)で作り直す。
 - 精度評価は [../measurements/fastsam/evaluate_3dpw.py](../measurements/fastsam/evaluate_3dpw.py) で実施。
 
 ## 推論と評価

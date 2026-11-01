@@ -280,25 +280,34 @@ def main() -> None:
         gt_v = np.stack(gt_v).astype(np.float32)
         gt_pa14 = np.stack(gt_pa14).astype(np.float32)
 
-        pred_h36m = np.einsum("jv,bvd->bjd", h36m_regressor, pred_v)[:, H36M14_EVAL_JOINTS]
-        gt_h36m = np.einsum("jv,bvd->bjd", h36m_regressor, gt_v)[:, H36M14_EVAL_JOINTS]
+        pred_h36m17 = np.einsum("jv,bvd->bjd", h36m_regressor, pred_v)
+        gt_h36m17 = np.einsum("jv,bvd->bjd", h36m_regressor, gt_v)
         pred_j24 = np.einsum("jv,bvd->bjd", smpl24_regressor, pred_v)
         gt_j24 = np.einsum("jv,bvd->bjd", smpl24_regressor, gt_v)
         pred_pa14 = pred_j24[:, THREEDPW_PA14]
+        if args.pa_protocol == "h36m14_global_orient":
+            # 本論文の評価: root（骨盤）= H36M の関節0
+            pred_root, gt_root = pred_h36m17[:, 0], gt_h36m17[:, 0]
+            pred_pelvis_all, gt_pelvis_all = pred_root, gt_root
+        else:
+            # 原論文の関節集合: root = 選んだ H36M14 の先頭（H36M の関節1）、PVE は SMPL の骨盤
+            pred_root, gt_root = pred_h36m17[:, H36M14_EVAL_JOINTS[0]], gt_h36m17[:, H36M14_EVAL_JOINTS[0]]
+            pred_pelvis_all, gt_pelvis_all = pred_j24[:, 0], gt_j24[:, 0]
 
-        for pred_j, gt_j, pred_vertices, gt_vertices, pred_pelvis, gt_pelvis, pred_pa_j, gt_pa_j in zip(
-            pred_h36m,
-            gt_h36m,
+        for pred_j, gt_j, pred_r, gt_r, pred_vertices, gt_vertices, pred_pelvis, gt_pelvis, pred_pa_j, gt_pa_j in zip(
+            pred_h36m17[:, H36M14_EVAL_JOINTS],
+            gt_h36m17[:, H36M14_EVAL_JOINTS],
+            pred_root,
+            gt_root,
             pred_v,
             gt_v,
-            pred_j24[:, 0],
-            gt_j24[:, 0],
+            pred_pelvis_all,
+            gt_pelvis_all,
             pred_pa14,
             gt_pa14,
         ):
-            # Root = first of the selected H36M14 joints (H36M joint 1), as in the original diagnostic.
-            pred_rooted = pred_j - pred_j[0:1]
-            gt_rooted = gt_j - gt_j[0:1]
+            pred_rooted = pred_j - pred_r[None, :]
+            gt_rooted = gt_j - gt_r[None, :]
             metrics["MPJPE"].append(mean_l2_mm(pred_rooted, gt_rooted))
             if args.pa_protocol == "h36m14_global_orient":
                 metrics["PA-MPJPE"].append(mean_l2_mm(procrustes_align(pred_rooted, gt_rooted), gt_rooted))
@@ -317,14 +326,23 @@ def main() -> None:
     summary["samples_dir"] = str(samples_dir)
     summary["vertices_npz"] = args.vertices_npz
     summary["pa_protocol"] = args.pa_protocol
+    h36m = args.pa_protocol == "h36m14_global_orient"
     summary["metric_protocol"] = {
-        "MPJPE": "H36M14 from SMPL vertices, root-relative, camera-frame GT",
+        "MPJPE": (
+            "H36M14 from SMPL vertices, H36M joint 0 root-relative, camera-frame GT"
+            if h36m
+            else "H36M14 from SMPL vertices, H36M joint 1 root-relative, camera-frame GT"
+        ),
         "PA-MPJPE": (
             "H36M14 from SMPL vertices, root-relative, camera-frame GT, Procrustes aligned"
             if args.pa_protocol == "h36m14_global_orient"
             else "SMPL J_regressor joints 0:14 vs 3DPW stored gt_joints_3d[0:14], Procrustes aligned"
         ),
-        "PVE": "SMPL vertices, pelvis-root-relative, camera-frame GT",
+        "PVE": (
+            "SMPL vertices, H36M joint 0 root-relative, camera-frame GT"
+            if h36m
+            else "SMPL vertices, SMPL pelvis-root-relative, camera-frame GT"
+        ),
         "MPVAE": "SMPL vertices, pelvis-root-relative, Procrustes aligned",
     }
 

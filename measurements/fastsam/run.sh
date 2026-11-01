@@ -48,7 +48,7 @@ infer_and_evaluate() {  # <名前> <チェックポイント> <環境変数...>
     local name="$1" checkpoint="$2"; shift 2
     local work="$OUT_DIR/accuracy_fastsam_$name"
     env "${COMMON_ENV[@]}" "$@" "$PYTHON" -u mhr2smpl/multi_view/step0_infer_3dpw.py \
-        --data_dir "$REPO_ROOT/datasets/3dpw" --output_dir "$work" --split test --frame_step 10 --max_samples 2000 \
+        --data_dir "$REPO_ROOT/datasets/3dpw" --output_dir "$work" --split test --frame_step 10 \
         --local_checkpoint_path "$checkpoint" --local_mhr_path "$checkpoint/assets/mhr_model.pt" \
         --detector yolo_pose --detector_model checkpoints/yolo/yolo11m-pose.engine --hand_box_source yolo_pose --context_factor 1.5
     for protocol in h36m14_global_orient paper_3dpw14; do
