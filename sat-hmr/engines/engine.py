@@ -25,117 +25,8 @@ assert version.parse(accelerate.__version__) >= version.parse("1.10.0"),\
       "Please use accelerate >= 1.10.0 to support our updated implementation of distributed evaluation (August 30, 2025)."
 
 
-def apply_torchao_int4(model, skip_modules=(), group_size=128):
-    import torch.nn as nn
-    try:
-        from torchao.quantization import quantize_, int4_weight_only
-    except Exception as exc:
-        raise RuntimeError("torchao is not available. Install torchao before enabling torchao_int4.") from exc
-
-    def _filter(module, fqn):
-        if not isinstance(module, nn.Linear):
-            return False
-        if skip_modules and any(s in fqn for s in skip_modules):
-            return False
-        w = module.weight
-        if type(w) not in (torch.Tensor, nn.Parameter):
-            return False
-        if w.shape[1] % group_size != 0:
-            return False
-        return w.shape[0] % 16 == 0
-
-    quantize_(model, int4_weight_only(group_size=group_size), filter_fn=_filter)
-    return f"int4_weight_only(group_size={group_size})"
-
-
-def apply_torchao_fp8(model):
-    try:
-        from torchao.quantization import quantize_, float8_weight_only
-    except Exception as exc:
-        raise RuntimeError("torchao is not available. Install torchao before enabling torchao_fp8.") from exc
-    quantize_(model, float8_weight_only())
-    return "float8_weight_only()"
-
-
-def _qat_prepare(model, skip_modules=(), group_size=128):
-    """INT4 weight-only QAT via module swap. Matches `int4_weight_only()` numerics.
-
-    - Weight: INT4 per-channel-group asymmetric, ZeroPointDomain.FLOAT (group_size=128)
-    - No activation fake quant (weight-only to match save-time int4_weight_only)
-
-    Layers skipped:
-    - in_features % group_size != 0  (e.g. dn_enc with in_features=82)
-    - Explicitly listed in skip_modules
-    """
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torchao.quantization.utils import get_groupwise_affine_qparams
-    from torchao.quantization.prototype.qat.utils import _fake_quantize_per_channel_group
-    from torchao.quantization.quant_primitives import ZeroPointDomain
-
-    class _QATLinear(nn.Linear):
-        """nn.Linear with INT4 weight-only fake quantization. Supports bias."""
-        def __init__(self, in_f, out_f, bias=True, device=None,
-                     groupsize=128, precision=torch.float32,
-                     scales_precision=torch.float32):
-            super().__init__(in_f, out_f, bias, device=device, dtype=precision)
-            assert in_f % groupsize == 0, \
-                f"in_features {in_f} not divisible by groupsize {groupsize}"
-            self.groupsize = groupsize
-            self.precision = precision
-            self.scales_precision = scales_precision
-            self._fake_quant_enabled = True
-
-        def forward(self, x):
-            if self._fake_quant_enabled:
-                w_s, w_zp = get_groupwise_affine_qparams(
-                    self.weight, 4, self.groupsize, self.scales_precision,
-                )
-                w_fq = _fake_quantize_per_channel_group(
-                    self.weight, w_s, w_zp, 0, 15,
-                    self.groupsize, ZeroPointDomain.FLOAT,
-                )
-            else:
-                w_fq = self.weight
-            return F.linear(x, w_fq, self.bias)
-
-    replaced = []
-    skipped = []
-
-    def _replace(module, prefix=''):
-        for name, child in module.named_children():
-            fqn = f'{prefix}.{name}' if prefix else name
-            if isinstance(child, nn.Linear) and not isinstance(child, _QATLinear):
-                if skip_modules and any(s in fqn for s in skip_modules):
-                    skipped.append(fqn)
-                    continue
-                if child.weight.shape[1] % group_size != 0:
-                    skipped.append(fqn)
-                    continue
-                qat_lin = _QATLinear(
-                    child.in_features, child.out_features,
-                    bias=(child.bias is not None),
-                    device=child.weight.device,
-                    groupsize=group_size,
-                    precision=child.weight.dtype,
-                    scales_precision=torch.float32,
-                )
-                qat_lin.weight = child.weight
-                if child.bias is not None:
-                    qat_lin.bias = child.bias
-                setattr(module, name, qat_lin)
-                replaced.append(fqn)
-            else:
-                _replace(child, fqn)
-
-    _replace(model)
-    print(f'[QAT] Replaced {len(replaced)} Linear layers, skipped {len(skipped)}')
-    if skipped:
-        print(f'[QAT] Skipped: {skipped}')
-    return model
-
-
-def apply_torchao_int8(model, weight_only=False, skip_modules=()):
+def apply_torchao_int8(model):
+    """Apply torchao dynamic INT8 quantization (int8 activation x int8 weight) to plain nn.Linear layers."""
     try:
         from torchao.quantization import quantize_
     except Exception as exc:
@@ -143,18 +34,6 @@ def apply_torchao_int8(model, weight_only=False, skip_modules=()):
             "torchao is not available in the active environment. "
             "Install torchao before enabling torchao_int8."
         ) from exc
-
-    if weight_only:
-        try:
-            from torchao.quantization import int8_weight_only
-            qcfg = int8_weight_only()
-            qcfg_name = "int8_weight_only()"
-        except Exception:
-            from torchao.quantization import Int8WeightOnlyConfig
-            qcfg = Int8WeightOnlyConfig()
-            qcfg_name = "Int8WeightOnlyConfig()"
-        quantize_(model, qcfg)
-        return qcfg_name
 
     try:
         from torchao.quantization import int8_dynamic_activation_int8_weight
@@ -169,16 +48,12 @@ def apply_torchao_int8(model, weight_only=False, skip_modules=()):
 
     stats = {
         "quantized": 0,
-        "skipped_name": [],
         "skipped_dim": [],
         "skipped_nonplain": 0,
     }
 
     def _filter(module, fqn):
         if not isinstance(module, nn.Linear):
-            return False
-        if skip_modules and any(s in fqn for s in skip_modules):
-            stats["skipped_name"].append(fqn)
             return False
         weight = getattr(module, "weight", None)
         if type(weight) not in (torch.Tensor, nn.Parameter):
@@ -198,7 +73,6 @@ def apply_torchao_int8(model, weight_only=False, skip_modules=()):
     )
     detail = (
         f"{qcfg_name}, quantized={stats['quantized']}, "
-        f"skipped_name={len(stats['skipped_name'])}, "
         f"skipped_dim={skipped_dim}"
     )
     if preview:
@@ -273,15 +147,8 @@ class Engine():
 
         use_bf16 = (self.mode != 'train') and is_bf16(getattr(args, 'dtype_cfg', 'fp32'))
         use_torchao_int8 = bool(getattr(args, 'torchao_int8', False))
-        use_torchao_int4 = bool(getattr(args, 'torchao_int4', False))
-        use_torchao_fp8  = bool(getattr(args, 'torchao_fp8', False))
-        # When loading a QAT-saved checkpoint, state_dict already contains AQT
-        # tensors, so apply_torchao_int4 must run BEFORE load_state_dict to
-        # prepare matching AQT slots on the model.
-        qat_weights = bool(getattr(args, 'qat_weights', False)) and use_torchao_int4
-        int4_skip = list(getattr(args, 'torchao_int4_skip_modules', []))
 
-        def _load_pretrain():
+        if args.pretrain:
             self.accelerator.print(f'Loading pretrained weights: {args.pretrain_path}')
             state_dict = torch.load(args.pretrain_path, weights_only=False)
             state_dict, int8_weight_info = dequantize_int8_weight_state_dict_if_needed(state_dict)
@@ -292,24 +159,10 @@ class Engine():
                 )
             self.unwrapped_model.load_state_dict(state_dict, strict=False)
 
-        if args.pretrain and not qat_weights:
-            _load_pretrain()
-
-        # QAT: insert FakeQuantize before DDP wrapping (train mode only)
-        self.use_qat = self.mode == 'train' and bool(getattr(args, 'use_qat', False))
-        if self.use_qat:
-            self._qat_args = args
-            skip = list(getattr(args, 'qat_skip_modules', []))
-            self.unwrapped_model = _qat_prepare(self.unwrapped_model, skip)
-            self.accelerator.print(
-                f'QAT prepare (W4A8 module swap): FakeQuantize inserted. '
-                f'Skipping modules: {skip if skip else "none"}'
-            )
-
         self.unwrapped_model.input_dtype = torch.bfloat16 if use_bf16 else torch.float32
 
-        if use_bf16 or use_torchao_int8 or use_torchao_int4 or use_torchao_fp8:
-            if self.mode == 'train' and (use_torchao_int8 or use_torchao_int4 or use_torchao_fp8):
+        if use_bf16 or use_torchao_int8:
+            if self.mode == 'train' and use_torchao_int8:
                 raise NotImplementedError('torchao quantization is only supported for eval/infer.')
             self.unwrapped_model = self.unwrapped_model.to(self.accelerator.device)
             if use_bf16:
@@ -317,22 +170,8 @@ class Engine():
                 self.accelerator.print('Using bfloat16 model/input.')
 
         if use_torchao_int8:
-            weight_only = bool(getattr(args, 'torchao_int8_weight_only', False))
-            qcfg_name = apply_torchao_int8(self.unwrapped_model, weight_only=weight_only)
+            qcfg_name = apply_torchao_int8(self.unwrapped_model)
             self.accelerator.print(f'Applying torchao int8: {qcfg_name}')
-
-        if use_torchao_int4:
-            self.unwrapped_model.to(torch.bfloat16)
-            qcfg_name = apply_torchao_int4(self.unwrapped_model, skip_modules=int4_skip)
-            self.accelerator.print(f'Applying torchao int4: {qcfg_name} (skip={int4_skip})')
-
-        if use_torchao_fp8:
-            self.unwrapped_model.to(torch.bfloat16)
-            qcfg_name = apply_torchao_fp8(self.unwrapped_model)
-            self.accelerator.print(f'Applying torchao fp8: {qcfg_name}')
-
-        if args.pretrain and qat_weights:
-            _load_pretrain()
 
         # to gpu
         self.model = self.accelerator.prepare(self.unwrapped_model)
@@ -515,9 +354,6 @@ class Engine():
             if epoch % self.save_and_eval_epoch == 0 or epoch == self.num_epochs-1:
                 self.save_and_eval(epoch, save_ckpt=True)
 
-        if getattr(self, 'use_qat', False):
-            self._convert_qat()
-
         self.accelerator.end_training()
 
     def eval(self, results_save_path = None, epoch = -1):
@@ -587,42 +423,6 @@ class Engine():
                         distributed = self.distributed_infer,
                         accelerator = self.accelerator)
             self.accelerator.wait_for_everyone()
-
-
-    def _convert_qat(self):
-        """Restore _QATLinear -> nn.Linear, apply torchao INT4, save state_dict.
-
-        Result: state_dict keys identical to the FP32 pretrain; weight values
-        are INT4 (AffineQuantizedTensor subclass on nn.Linear).
-        """
-        import torch.nn as nn
-
-        def _restore(module):
-            for name, child in module.named_children():
-                if isinstance(child, nn.Linear) and hasattr(child, '_fake_quant_enabled'):
-                    lin = nn.Linear(
-                        child.in_features, child.out_features,
-                        bias=(child.bias is not None),
-                        device=child.weight.device,
-                        dtype=child.weight.dtype,
-                    )
-                    lin.weight = child.weight
-                    if child.bias is not None:
-                        lin.bias = child.bias
-                    setattr(module, name, lin)
-                else:
-                    _restore(child)
-
-        self.accelerator.print('QAT: restoring Linear modules and applying INT4...')
-        _restore(self.unwrapped_model)
-        self.unwrapped_model.to(torch.bfloat16)
-        skip = list(getattr(self._qat_args, 'qat_skip_modules', []))
-        apply_torchao_int4(self.unwrapped_model, skip_modules=skip, group_size=128)
-
-        if self.accelerator.is_main_process:
-            save_path = os.path.join(self.ckpt_dir, self.exp_name, 'qat_int4_weights.pth')
-            torch.save(self.unwrapped_model.state_dict(), save_path)
-            self.accelerator.print(f'QAT INT4 weights saved: {save_path}')
 
 
 def flatten_dict(d, parent_key='', sep='-'):

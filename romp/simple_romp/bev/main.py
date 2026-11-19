@@ -7,7 +7,6 @@ import torch
 from torch import nn
 import argparse
 import copy
-import time
 
 from .model import BEVv1
 from .post_parser import SMPLA_parser, body_mesh_projection2image, pack_params_dict,\
@@ -299,16 +298,10 @@ def main():
     if args.mode == 'video':
         frame_paths, video_save_path = collect_frame_path(args.input, args.save_path)
         saver = ResultSaver(args.mode, args.save_path)
-        mesh_times = []
         for frame_path in progress_bar(frame_paths):
             image = cv2.imread(frame_path)
-            start_time = time.time()
             outputs = bev(image)
-            mesh_times.append(time.time() - start_time)
             saver(outputs, frame_path, prefix=f'_{model_id}_{args.center_thresh}')
-        average_mesh_time = sum(mesh_times) / len(mesh_times)
-        print(f"平均メッシュ生成時間：{average_mesh_time}\n")
-        
         save_video_results(saver.frame_save_paths)
         if args.save_video:
             saver.save_video(video_save_path, frame_rate=args.frame_rate)

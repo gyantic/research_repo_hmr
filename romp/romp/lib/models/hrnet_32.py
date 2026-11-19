@@ -164,10 +164,6 @@ class HigherResolutionNet(nn.Module):
 
     def forward(self, x):
         x = ((BHWC_to_BCHW(x)/ 255.) * 2.0 - 1.0).contiguous()
-        if args().model_precision == "fp16":
-            x = x.half()
-        elif args().model_precision == "bf16":
-            x = x.to(torch.bfloat16)
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)

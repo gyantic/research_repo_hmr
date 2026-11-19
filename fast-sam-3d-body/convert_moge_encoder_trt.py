@@ -33,7 +33,6 @@ from trt_calibration_frames import (
 TRT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "moge_trt")
 ONNX_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_dinov2_encoder.onnx")
 TRT_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_dinov2_encoder_fp16.engine")
-INT8_CALIB_CACHE_PATH = os.path.join(TRT_OUTPUT_DIR, "moge_int8_calib.cache")
 
 # Model config for MoGe2 ViT-S with resolution_level=0
 IMAGE_SIZE = 512
@@ -190,8 +189,8 @@ def _make_video_calibrator(trt, video_path=DEFAULT_CALIB_VIDEO, num_frames=DEFAU
             return None
 
         def write_calibration_cache(self, cache):
-            with open(INT8_CALIB_CACHE_PATH, "wb") as f:
-                f.write(cache)
+            # Required by the calibrator interface; the cache is never reused, so it is not saved.
+            pass
 
     return _VideoCalibrator()
 

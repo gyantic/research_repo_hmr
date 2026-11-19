@@ -6,6 +6,8 @@ are relative to it) with ``PYTHONPATH="$PWD:$PWD/romp"``.
 """
 import sys
 
+import torch
+
 
 def build_video_processor(configs_yml, inputs, gpu, extra_args=()):
     """Return an initialised ``Video_processor``.
@@ -13,7 +15,13 @@ def build_video_processor(configs_yml, inputs, gpu, extra_args=()):
     ``gpu`` is ROMP's string GPU id ("0", or "-1" for CPU). ``extra_args`` are
     appended ROMP CLI arguments (e.g. ``["--model_precision", "bf16"]``) and
     override values from ``configs_yml``.
+
+    Also fixes the CPU thread counts used for the paper measurements (2 intra-op,
+    1 inter-op); this must run before any parallel torch work in the process.
     """
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(1)
+
     arg_list = ["--configs_yml", configs_yml, "--inputs", inputs, "--gpu", gpu, *extra_args]
     # ROMP modules inspect sys.argv at import time (they append a default
     # --configs_yml when none is present), so replace it before importing them.

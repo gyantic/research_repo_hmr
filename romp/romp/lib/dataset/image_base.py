@@ -139,11 +139,6 @@ class Image_base(Dataset):
             'all_person_detected_mask':torch.Tensor([all_person_detected_mask]).bool(),
             'imgpath': info['imgpath'],
             'data_set': info['ds']}
-        sam3d_pose = info.get('sam3d_pose', None)
-        if 'sam3d_pose' in info:
-            input_data['sam3d_pose'] = torch.from_numpy(sam3d_pose).float()
-        if 'sam3d_valid' in info:
-            input_data['sam3d_valid'] = torch.tensor([info['sam3d_valid']], dtype=torch.float32)  # (1,)
         
         input_data = self.add_cam_parameters(input_data, info)
 

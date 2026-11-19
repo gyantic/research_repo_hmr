@@ -98,8 +98,6 @@ def write_stats_csv(path, inference_times_ms, total_times_ms):
 def main():
     args = parse_args()
     stats_csv = args.stats_csv or default_stats_csv(args.configs_yml)
-    torch.set_num_threads(2)          # 計測時と同じ CPU スレッド数
-    torch.set_num_interop_threads(1)
 
     sock, ue_host, hello_time = wait_for_hello(args.local_port)
 

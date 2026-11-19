@@ -3,6 +3,8 @@
 import os
 import torch
 
+from sam_3d_body.utils.quiet import quiet_print
+
 # FOV_MODEL: MoGe2 model size (s=35M, b=104M, l=331M)
 #   - s: Ruicheng/moge-2-vits-normal (fastest)
 #   - b: Ruicheng/moge-2-vitb-normal
@@ -196,8 +198,7 @@ def run_moge(model, input_image, device, fixed_size=0, resolution_level=9):
         size_str = f"{H}x{W}"
 
     # Print model dtype info
-    if not os.environ.get("SAM3D_QUIET"):
-        print(f"          [DEBUG] Model: MoGe2 (FOV Estimator), input_dtype: {input_tensor.dtype}, param_dtype: {model_dtype}, input_size: {size_str}, resolution_level: {resolution_level}")
+    quiet_print(f"          [DEBUG] Model: MoGe2 (FOV Estimator), input_dtype: {input_tensor.dtype}, param_dtype: {model_dtype}, input_size: {size_str}, resolution_level: {resolution_level}")
 
     # Infer w/ MoGe2
     moge_data = model.infer(input_tensor, resolution_level=resolution_level)

@@ -9,8 +9,12 @@ UDP ありの各行を、同じ手法・数値精度・実行設定の UDP な�
 import argparse
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
 from plot_common import (SERIES_COLORS, add_common_args, is_quantized, load_plot_rows,
-                         np, pd, plt, save_figure, series_name)
+                         save_figure, series_name)
 
 MATCH_COLUMNS = ["method", "backbone", "dtype", "quantization_mode", "runtime_variant"]
 
@@ -42,7 +46,6 @@ def build_udp_table(rows_no_udp, rows_udp):
         baseline = baseline_rows.iloc[0]
         quantized = is_quantized(udp_row)
         quantization_tag = " / INT8" if quantized else ""
-        compile_tag = " / compile" if udp_row["compile"] else " / no compile"
         precision = "INT8" if quantized else str(udp_row["dtype"])
         if udp_row["method"] == "ROMP":
             short_label = f"{udp_row['method']} ({udp_row['backbone']})\n({precision})"
@@ -52,7 +55,7 @@ def build_udp_table(rows_no_udp, rows_udp):
         overhead_ms = udp_row["robust_infer_ms_median"] - baseline["robust_infer_ms_median"]
         table.append({
             "method":            udp_row["method"],
-            "config":            f"{series_name(udp_row)} / {udp_row['dtype']}{quantization_tag}{compile_tag}",
+            "config":            f"{series_name(udp_row)} / {udp_row['dtype']}{quantization_tag} / compile",
             "short_label":       short_label,
             "compile":           bool(udp_row["compile"]),
             "latency_ms_no_udp": baseline["robust_infer_ms_median"],

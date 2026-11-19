@@ -67,7 +67,7 @@
 |---|---|
 | [ue/](ue/) | UEパッケージを用いた動画推論・録画・実写映像との合成スクリプト（UEプロジェクト本体はGitHub Releasesで配布） |
 | [romp/](romp/) | ROMPの改変版（bf16化、`torch.compile`、UEへの姿勢送信機能を追加） |
-| [sat-hmr/](sat-hmr/) | SAT-HMRの改変版（bf16化・INT8量子化、`torch.compile`、TensorRT対応、UEへの姿勢送信機能を追加） |
+| [sat-hmr/](sat-hmr/) | SAT-HMRの改変版（bf16化・INT8量子化、`torch.compile`、UEへの姿勢送信機能を追加） |
 | [fast-sam-3d-body/](fast-sam-3d-body/) | Fast-SAM-3D-Bodyの改変版（bf16化・TensorRTによるINT8量子化、`torch.compile`、MHR→SMPL変換、UEへの姿勢送信機能を追加） |
 | [measurements/](measurements/) | 論文用の各種計測（推論速度・推定精度・UE同時実行時の負荷）、結果の集計、および論文図表の生成スクリプト |
 
@@ -287,6 +287,11 @@ conda activate romp_3.9
 cd romp
 python tools/export_quantized_weights_romp.py --input trained_models/ROMP_HRNet32_V1.pkl --output trained_models/
 python tools/export_quantized_weights_romp.py --input trained_models/ROMP_ResNet50_V1.pkl --output trained_models/
+# ResNet50のINT8重み
+python tools/export_quantized_weights_romp.py --input trained_models/ROMP_ResNet50_V1.pkl --output trained_models/ --format int8_raw
+# HRNet32のINT8重み（torchaoが動作する環境で実行。torch 2.9.1 + torchao 0.17.0 で確認済み）
+# --device cpu で配布版と同一のファイルになります（GPUで量子化すると丸めの差が出ます）
+python tools/export_torchao_int8_backbone_romp.py --input trained_models/ROMP_HRNet32_V1.pkl --output trained_models/ --device cpu
 cd ..
 
 # SAT-HMRのbf16・INT8重み（sathmr-copy環境）
@@ -357,7 +362,7 @@ python measurements/cmu_panoptic/make_person_clips.py
 
 ### 4.1 ROMP
 
-モデル、数値精度、コンパイルの条件は `measurements/romp/configs/` のYAML（`model_path` から `romp/trained_models/` を参照）とコマンド引数で指定します。
+モデルやコンパイルの条件は `measurements/romp/configs/` のYAML（`model_path` から `romp/trained_models/` を参照）で指定します。数値精度だけはコマンド引数 `--dtype_cfg`（`fp32` / `bf16`、既定は `fp32`）で指定し、YAMLの `model_precision` より優先されます。
 
 ```bash
 conda activate romp_3.9
@@ -393,11 +398,8 @@ python video_demo.py \
 | ファイル | 内容 |
 |---|---|
 | [sat-hmr/video_demo.py](sat-hmr/video_demo.py) | PyTorchによる動画推論。SMPL姿勢のUEへのUDP送信と描画 |
-| `sat-hmr/video_demo_trt.py` | TensorRT版動画推論デモ |
-| `sat-hmr/webcam_demo_trt.py` | Webカメラでの実時間推論（TensorRT） |
-| `sat-hmr/models/int8_attention.py`、`static_int8_fused.py` | INT8量子化の中核実装 |
-| [sat-hmr/tools/](sat-hmr/tools/) | 量子化、ONNX/TensorRTエクスポート、キャリブレーション、TensorRTでの3DPW評価 |
-| `sat-hmr/configs/run/eval_3dpw_*.yaml`、`train_qat.yaml` | 3DPW評価・QATの設定 |
+| `sat-hmr/tools/quantize_weights_int8.py` | INT8量子化重みの作成 |
+| `sat-hmr/configs/run/eval_3dpw_*.yaml` | 3DPW評価の設定 |
 
 <a id="fast-sam-3d-body"></a>
 
@@ -407,9 +409,9 @@ UEへの配信には `run_publisher_ue.py` を使用します。SMPLモデル、
 
 | ファイル | 内容 |
 |---|---|
-| [fast-sam-3d-body/run_publisher_ue.py](fast-sam-3d-body/run_publisher_ue.py) | リアルタイムSMPLパブリッシャ。ZMQ配信に加え、UEへUDP/TCP送信。INT8/TensorRTバックボーン・CUDA Graph・compileを環境変数で制御。論文のINT8 TensorRT・UE連携時の速度計測で使用 |
+| [fast-sam-3d-body/run_publisher_ue.py](fast-sam-3d-body/run_publisher_ue.py) | リアルタイムSMPLパブリッシャ。ZMQ配信に加え、UEへUDP送信。INT8/TensorRTバックボーン・CUDA Graph・compileを環境変数で制御。論文のINT8 TensorRT・UE連携時の速度計測で使用 |
 | `fast-sam-3d-body/mocap/realtime/ue_sender.py` | `run_publisher_ue.py` が使うUE送信モジュール |
-| `fast-sam-3d-body/build_tensorrt.sh`、`convert_backbone_tensorrt.py`、`convert_moge_encoder_trt.py`、`convert_yolo_pose_trt.py`、`sam_3d_body/models/backbones/dinov3_tensorrt.py` | TensorRT変換 |
+| `fast-sam-3d-body/convert_backbone_tensorrt.py`、`convert_moge_encoder_trt.py`、`sam_3d_body/models/backbones/dinov3_tensorrt.py` | TensorRT変換 |
 | [fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py](fast-sam-3d-body/mhr2smpl/multi_view/step0_infer_3dpw.py) | 精度評価の入力となる3DPW推論サンプル（`sample_*.npz`）の生成 |
 
 ---

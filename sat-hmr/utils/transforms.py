@@ -29,13 +29,7 @@ def to_zorder(img, z_order_map, y_coords, x_coords):
     h, w = img.shape[:2]
     assert max(h,w) <= z_order_map.shape[0]
     clipped_z = z_order_map[:h,:w].flatten()
-    if torch.onnx.is_in_onnx_export():
-        # During ONNX export, z-order map is constant for fixed input shape.
-        # Compute sort indices in Python to avoid dynamic TopK/Gather index flow.
-        sorted_idx_list = np.argsort(clipped_z.detach().cpu().numpy()).tolist()
-        sorted_idx = torch.tensor(sorted_idx_list, device=img.device, dtype=torch.int64)
-    else:
-        sorted_idx = torch.argsort(clipped_z)
+    sorted_idx = torch.argsort(clipped_z)
 
     flat_img = img.flatten(0,1)
     img_z = torch.index_select(flat_img, 0, sorted_idx)
@@ -243,21 +237,6 @@ def rotation_matrix_to_quaternion(rotation_matrix, eps=1e-6):
 def rot6d_to_axis_angle(x):
     bs,num_queries,_ = x.shape
     rot_mat = rot6d_to_rotmat(x)
-    if torch.onnx.is_in_onnx_export():
-        # Export path: branchless axis-angle conversion to avoid bool-mask subgraphs
-        # (Less/And/Not/Cast) that block strict INT8 TensorRT builds.
-        r = rot_mat.reshape(-1, 3, 3)
-        trace = r[:, 0, 0] + r[:, 1, 1] + r[:, 2, 2]
-        cos_theta = ((trace - 1.0) * 0.5).clamp(min=-1.0 + 1e-6, max=1.0 - 1e-6)
-        theta = torch.acos(cos_theta)
-
-        rx = r[:, 2, 1] - r[:, 1, 2]
-        ry = r[:, 0, 2] - r[:, 2, 0]
-        rz = r[:, 1, 0] - r[:, 0, 1]
-        axis = torch.stack([rx, ry, rz], dim=1) / (2.0 * torch.sin(theta).unsqueeze(1) + 1e-6)
-        axis_angle = axis * theta.unsqueeze(1)
-        return axis_angle.reshape(bs, num_queries, -1)
-
     pad = torch.zeros(
         (rot_mat.shape[0], 3, 1),
         device=rot_mat.device,

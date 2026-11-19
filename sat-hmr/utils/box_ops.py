@@ -47,9 +47,12 @@ def generalized_box_iou(boxes1, boxes2):
     Returns a [N, M] pairwise matrix, where N = len(boxes1)
     and M = len(boxes2)
     """
-    # clamp to ensure x2 >= x1, y2 >= y1 (QAT fake quant noise can produce negative w/h)
-    boxes1 = torch.cat([boxes1[:, :2], torch.max(boxes1[:, 2:], boxes1[:, :2])], dim=1)
-    boxes2 = torch.cat([boxes2[:, :2], torch.max(boxes2[:, 2:], boxes2[:, :2])], dim=1)
+    # degenerate boxes gives inf / nan results
+    # so do an early check
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    # except:
+    #     import ipdb; ipdb.set_trace()
     iou, union = box_iou(boxes1, boxes2)
 
     lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
@@ -88,9 +91,10 @@ def generalized_box_iou_pairwise(boxes1, boxes2):
     Output:
         - giou: N, 4
     """
-    # clamp to ensure x2 >= x1, y2 >= y1 (QAT fake quant noise can produce negative w/h)
-    boxes1 = torch.cat([boxes1[:, :2], torch.max(boxes1[:, 2:], boxes1[:, :2])], dim=1)
-    boxes2 = torch.cat([boxes2[:, :2], torch.max(boxes2[:, 2:], boxes2[:, :2])], dim=1)
+    # degenerate boxes gives inf / nan results
+    # so do an early check
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
     assert boxes1.shape == boxes2.shape
     iou, union = box_iou_pairwise(boxes1, boxes2) # N, 4
 

@@ -42,20 +42,6 @@ class Trainer(Base):
             outputs.update(self._calc_loss(outputs))
         loss, outputs = self.merge_losses(outputs, self.train_cfg['new_training'])
 
-        if self.global_count == 1:
-            logging.info(f"[KD] sam3d_pose in meta_data: {'sam3d_pose' in meta_data}, "
-                     f"is None: {meta_data.get('sam3d_pose') is None}")
-        if 'sam3d_pose' in meta_data:
-            params = outputs['params']
-            student_pose = params['poses'] 
-            student_pose = student_pose.reshape(student_pose.shape[0], -1)
-            teacher_pose  = meta_data['sam3d_pose'].to(student_pose.device).float()
-            L_pose_kd  = torch.nn.functional.smooth_l1_loss(student_pose,  teacher_pose)
-            lambda_pose  = 100.0
-            loss = loss + lambda_pose * L_pose_kd
-            outputs.setdefault('loss_dict', {})
-            outputs['loss_dict']['sam3d_pose_kd']  = L_pose_kd.detach()
-            
         if torch.isnan(loss) or torch.isinf(loss):
             print("Skipping batch due to nan/inf loss")
             self.optimizer.zero_grad()
@@ -70,7 +56,6 @@ class Trainer(Base):
     def train_log_visualization(self, outputs, loss, run_time, data_time, losses, losses_dict, epoch, iter_index):
         losses.update(loss.item())
         losses_dict.update(outputs['loss_dict'])
-        self.print_freq = 1
         if self.global_count%self.print_freq==0:
             message = 'Epoch: [{0}][{1}/{2}] Time {data_time.avg:.2f} RUN {run_time.avg:.2f} Lr {lr} Loss {loss.avg:.2f} | Losses {3}'.format(
                       epoch, iter_index + 1,  len(self.loader), losses_dict.avg(), #Acc {3} | accuracies.avg(), 

@@ -17,6 +17,8 @@ Usage:
 Output:
     trained_models/ROMP_HRNet32_V1_bf16.pth  (サイズ約50%削減)
 
+    --format int8_raw を指定すると trained_models/<name>_int8_raw_weights.pth を出力する。
+
 Loading:
     configs/video.yml で model_precision: 'bf16' を設定し、
     model_path を生成した _bf16.pth ファイルに指定する。
@@ -26,6 +28,7 @@ Loading:
 from __future__ import annotations
 
 import argparse
+import collections
 import pathlib
 import torch
 
@@ -44,6 +47,14 @@ def convert_state_dict_bf16(state_dict: dict) -> dict:
     return out
 
 
+def convert_state_dict_int8_raw(state_dict: dict) -> collections.OrderedDict:
+    """浮動小数テンソルを int8 に変換する（キー・順序はそのまま）。"""
+    return collections.OrderedDict(
+        (k, v.to(torch.int8) if isinstance(v, torch.Tensor) and v.is_floating_point() else v)
+        for k, v in state_dict.items()
+    )
+
+
 def load_state_dict(path: pathlib.Path) -> dict:
     """DataParallel prefix ('module.') を除去して state dict を返す。"""
     _raw, state_dict = load_checkpoint(path)
@@ -56,11 +67,21 @@ def main() -> None:
     )
     ap.add_argument("--input",  required=True, help="Input checkpoint (.pkl / .pth)")
     ap.add_argument("--output", required=True, help="Output directory")
+    ap.add_argument("--format", default="bf16", choices=["bf16", "int8_raw"],
+                    help="bf16 (default) or int8_raw")
     args = ap.parse_args()
 
     inp = pathlib.Path(args.input)
     out_dir = pathlib.Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.format == "int8_raw":
+        print(f"[INFO] Loading: {inp}  ({file_size_mb(inp):.1f} MB)")
+        _raw, sd = load_checkpoint(inp)
+        out_path = out_dir / f"{inp.stem}_int8_raw_weights.pth"
+        torch.save(convert_state_dict_int8_raw(sd), out_path)
+        print(f"[INFO] Saved: {out_path}  ({file_size_mb(out_path):.1f} MB)")
+        return
 
     print(f"[INFO] Loading: {inp}  ({file_size_mb(inp):.1f} MB)")
     sd = load_state_dict(inp)

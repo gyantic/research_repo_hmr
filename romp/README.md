@@ -39,7 +39,7 @@ CUDA_HOME=/usr/local/cuda-11.8 FORCE_CUDA=1 python -m pip install --no-build-iso
 
 ## 動画推論の実行
 
-入力には、使用環境の OpenCV で読み込める動画形式を用意してください。使用するモデル、数値精度、コンパイルの有無などの条件は、`measurements/romp/configs/` のYAMLファイルとコマンドライン引数で指定します。
+入力には、使用環境の OpenCV で読み込める動画形式を用意してください。使用するモデルやコンパイルの有無などの条件は `measurements/romp/configs/` のYAMLファイル（`--configs_yml`）で指定します。数値精度だけはコマンドライン引数 `--dtype_cfg`（`fp32` / `bf16`、既定は `fp32`）で指定し、YAMLの `model_precision` より優先されます。
 
 ```bash
 conda activate romp_3.9

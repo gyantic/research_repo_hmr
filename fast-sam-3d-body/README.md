@@ -10,9 +10,9 @@
 
 | ファイル | 内容 |
 |---|---|
-| [run_publisher_ue.py](run_publisher_ue.py) | リアルタイムSMPLパブリッシャ。ZMQ配信に加え、Unreal EngineへのUDP/TCP送信に対応。INT8/TensorRTバックボーン・CUDA Graph・`torch.compile` を環境変数で制御（論文のFast-SAM-3D-Body INT8 TensorRTおよびUE連携時の速度計測で使用） |
+| [run_publisher_ue.py](run_publisher_ue.py) | リアルタイムSMPLパブリッシャ。ZMQ配信に加え、Unreal EngineへのUDP送信に対応。INT8/TensorRTバックボーン・CUDA Graph・`torch.compile` を環境変数で制御（論文のFast-SAM-3D-Body INT8 TensorRTおよびUE連携時の速度計測で使用） |
 | `mocap/realtime/ue_sender.py` | `run_publisher_ue.py` が使用するUE通信モジュール |
-| `build_tensorrt.sh`<br>`convert_backbone_tensorrt.py`<br>`convert_moge_encoder_trt.py`<br>`convert_yolo_pose_trt.py`<br>`sam_3d_body/models/backbones/dinov3_tensorrt.py` | TensorRT変換スクリプトおよびランタイム実装まわりの改変 |
+| `convert_backbone_tensorrt.py`<br>`convert_moge_encoder_trt.py`<br>`sam_3d_body/models/backbones/dinov3_tensorrt.py` | TensorRT変換スクリプト（INT8対応）およびランタイム実装まわりの改変 |
 | [mhr2smpl/multi_view/step0_infer_3dpw.py](mhr2smpl/multi_view/step0_infer_3dpw.py) | 3DPW推論サンプル（`sample_*.npz`）の生成スクリプト（Fast-SAM-3D-Bodyの精度評価の入力データを作成） |
 
 ---
@@ -57,7 +57,7 @@ python run_publisher_ue.py --help
 
 ### 速度計測・精度評価
 
-- **速度計測**：[../measurements/fastsam/benchmark_fastsam3dbody.py](../measurements/fastsam/benchmark_fastsam3dbody.py) を使用します。`--repo` にこのディレクトリ（`fast-sam-3d-body`）、`--video` に入力動画、`--output_csv` に出力先を指定します（`--output_csv` には作業ディレクトリ変更の影響を受けない**絶対パス**を指定してください）。
+- **速度計測**：[../measurements/fastsam/benchmark_fastsam3dbody.py](../measurements/fastsam/benchmark_fastsam3dbody.py) を使用します。`--video` に入力動画、`--output_csv` に出力先を指定します（`--output_csv` には作業ディレクトリ変更の影響を受けない**絶対パス**を指定してください）。
 - **精度評価**：`mhr2smpl/multi_view/step0_infer_3dpw.py` で3DPWの推論サンプル（`sample_*.npz`）を生成したのち、[../measurements/fastsam/evaluate_3dpw.py](../measurements/fastsam/evaluate_3dpw.py) で評価指標を算出します。
 - **一括実行**：論文の計測（速度・精度・UE連携時のUDP送信）は、リポジトリのルートから [../measurements/fastsam/run.sh](../measurements/fastsam/run.sh) でまとめて実行できます。
 

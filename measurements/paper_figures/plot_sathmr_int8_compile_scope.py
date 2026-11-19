@@ -7,7 +7,10 @@
 
 import argparse
 
-from plot_common import add_common_args, load_ok_rows, np, plt, save_figure
+import matplotlib.pyplot as plt
+import numpy as np
+
+from plot_common import add_common_args, load_ok_rows, save_figure
 
 # runtime_variant -> 図のラベル（上から表示する順）
 SCOPE_LABELS = {

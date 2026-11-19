@@ -184,25 +184,22 @@ _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-def _load_calib_frames(video_path=None, num_frames=DEFAULT_NUM_CALIB_FRAMES):
+def _load_calib_frames(num_frames=DEFAULT_NUM_CALIB_FRAMES):
     """Load calibration frames as ImageNet-normalized FP32 [1, 3, H, W] CUDA tensors."""
-    if video_path is None:
-        video_path = DEFAULT_CALIB_VIDEO
-
     mean = torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1).cuda()
     std = torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1).cuda()
 
     frames = []
     for frame in sample_video_frames_rgb(
-        video_path, num_frames, width=IMAGE_SIZE[1], height=IMAGE_SIZE[0]
+        DEFAULT_CALIB_VIDEO, num_frames, width=IMAGE_SIZE[1], height=IMAGE_SIZE[0]
     ):
         t = torch.from_numpy(frame).float().cuda().permute(2, 0, 1).unsqueeze(0) / 255.0
         frames.append((t - mean) / std)
-    print(f"  [Calib] Loaded {len(frames)} frames from {video_path}")
+    print(f"  [Calib] Loaded {len(frames)} frames from {DEFAULT_CALIB_VIDEO}")
     return frames
 
 
-def step2b_quantize_onnx(video_path=None, num_frames=DEFAULT_NUM_CALIB_FRAMES):
+def step2b_quantize_onnx(num_frames=DEFAULT_NUM_CALIB_FRAMES):
     """
     Explicit INT8 PTQ using nvidia-modelopt on PyTorch (CUDA).
 
@@ -230,7 +227,7 @@ def step2b_quantize_onnx(video_path=None, num_frames=DEFAULT_NUM_CALIB_FRAMES):
     wrapper.eval().cuda().float()
 
     # Load calibration frames
-    calib_frames = _load_calib_frames(video_path=video_path, num_frames=num_frames)
+    calib_frames = _load_calib_frames(num_frames=num_frames)
 
     def forward_loop(model):
         with torch.no_grad():
@@ -440,95 +437,90 @@ def _time_trt_ms_per_call(trt_backbone, x, warmup_iters=5, timed_iters=50):
     return (time.perf_counter() - start) * 1000 / timed_iters
 
 
-def step3_benchmark(backbone, save_results=True):
-    """Benchmark PyTorch vs TensorRT."""
+def step3_benchmark(backbone):
+    """Benchmark PyTorch vs TensorRT (batch size 1)."""
     print("\n" + "=" * 60)
     print("Step 3: Benchmark")
     print("=" * 60)
 
-    results = {"timestamp": datetime.datetime.now().isoformat(), "gpu": torch.cuda.get_device_name(0), "batch_sizes": {}}
+    timestamp = datetime.datetime.now().isoformat()
+    gpu = torch.cuda.get_device_name(0)
+    batch_size = 1
+    print(f"\n  Batch size: {batch_size}")
 
-    # Test different batch sizes
-    for batch_size in [1]:
-        print(f"\n  Batch size: {batch_size}")
+    # Test input
+    x = torch.randn(batch_size, 3, *IMAGE_SIZE, device="cuda", dtype=torch.float32)
+    batch_results = {}
 
-        # Test input
-        x = torch.randn(batch_size, 3, *IMAGE_SIZE, device="cuda", dtype=torch.float32)
-        batch_results = {}
+    # PyTorch (BF16)
+    print("  [PyTorch BF16]")
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        # Warmup
+        for _ in range(5):
+            with torch.no_grad():
+                _ = backbone(x)
+        torch.cuda.synchronize()
 
-        # PyTorch (BF16)
-        print("  [PyTorch BF16]")
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            # Warmup
-            for _ in range(5):
-                with torch.no_grad():
-                    _ = backbone(x)
-            torch.cuda.synchronize()
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(50):
+            with torch.no_grad():
+                _ = backbone(x)
+        torch.cuda.synchronize()
+        pt_time = (time.perf_counter() - start) * 1000 / 50
+        print(f"    Time: {pt_time:.3f} ms/call")
+        batch_results["pytorch_bf16_ms"] = round(pt_time, 3)
 
-            # Benchmark
-            start = time.perf_counter()
-            for _ in range(50):
-                with torch.no_grad():
-                    _ = backbone(x)
-            torch.cuda.synchronize()
-            pt_time = (time.perf_counter() - start) * 1000 / 50
-            print(f"    Time: {pt_time:.3f} ms/call")
-            batch_results["pytorch_bf16_ms"] = round(pt_time, 3)
+    # TensorRT FP16
+    if os.path.exists(TRT_PATH_FP16):
+        print("  [TensorRT FP16]")
+        trt_backbone = TRTBackbone(TRT_PATH_FP16)
+        trt_time = _time_trt_ms_per_call(trt_backbone, x)
+        print(f"    Time: {trt_time:.3f} ms/call")
+        print(f"    Speedup: {pt_time / trt_time:.2f}x")
+        batch_results["trt_fp16_ms"] = round(trt_time, 3)
+        batch_results["trt_fp16_speedup"] = round(pt_time / trt_time, 2)
 
-        # TensorRT FP16
+        # Verify output
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.no_grad():
+                pt_out = backbone(x)
+        trt_out = trt_backbone(x)
+
+        diff = (pt_out.float() - trt_out.float()).abs()
+        print(f"    Max diff: {diff.max().item():.6f}")
+        print(f"    Mean diff: {diff.mean().item():.6f}")
+    else:
+        print("  [TensorRT FP16] Engine not found, skipping...")
+
+    # TensorRT INT8
+    if os.path.exists(TRT_PATH_INT8):
+        print("  [TensorRT INT8+FP16]")
+        trt_backbone_int8 = TRTBackbone(TRT_PATH_INT8)
+        int8_time = _time_trt_ms_per_call(trt_backbone_int8, x)
+        print(f"    Time: {int8_time:.3f} ms/call")
+        print(f"    Speedup vs PyTorch: {pt_time / int8_time:.2f}x")
+        batch_results["trt_int8_ms"] = round(int8_time, 3)
+        batch_results["trt_int8_speedup_vs_pytorch"] = round(pt_time / int8_time, 2)
         if os.path.exists(TRT_PATH_FP16):
-            print("  [TensorRT FP16]")
-            trt_backbone = TRTBackbone(TRT_PATH_FP16)
-            trt_time = _time_trt_ms_per_call(trt_backbone, x)
-            print(f"    Time: {trt_time:.3f} ms/call")
-            print(f"    Speedup: {pt_time / trt_time:.2f}x")
-            batch_results["trt_fp16_ms"] = round(trt_time, 3)
-            batch_results["trt_fp16_speedup"] = round(pt_time / trt_time, 2)
+            sp = trt_time / int8_time
+            print(f"    Speedup vs FP16: {sp:.2f}x")
+            batch_results["trt_int8_speedup_vs_fp16"] = round(sp, 2)
 
-            # Verify output
-            with torch.cuda.amp.autocast(dtype=torch.float16):
-                with torch.no_grad():
-                    pt_out = backbone(x)
-            trt_out = trt_backbone(x)
-
-            diff = (pt_out.float() - trt_out.float()).abs()
-            print(f"    Max diff: {diff.max().item():.6f}")
-            print(f"    Mean diff: {diff.mean().item():.6f}")
-        else:
-            print("  [TensorRT FP16] Engine not found, skipping...")
-
-        # TensorRT INT8
-        if os.path.exists(TRT_PATH_INT8):
-            print("  [TensorRT INT8+FP16]")
-            trt_backbone_int8 = TRTBackbone(TRT_PATH_INT8)
-            int8_time = _time_trt_ms_per_call(trt_backbone_int8, x)
-            print(f"    Time: {int8_time:.3f} ms/call")
-            print(f"    Speedup vs PyTorch: {pt_time / int8_time:.2f}x")
-            batch_results["trt_int8_ms"] = round(int8_time, 3)
-            batch_results["trt_int8_speedup_vs_pytorch"] = round(pt_time / int8_time, 2)
-            if os.path.exists(TRT_PATH_FP16):
-                sp = trt_time / int8_time
-                print(f"    Speedup vs FP16: {sp:.2f}x")
-                batch_results["trt_int8_speedup_vs_fp16"] = round(sp, 2)
-
-        results["batch_sizes"][str(batch_size)] = batch_results
-
-    if save_results:
-        out_path = os.path.join(TRT_OUTPUT_DIR, "benchmark_results.csv")
-        with open(out_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["timestamp", "gpu", "batch_size", "pytorch_bf16_ms", "trt_fp16_ms", "trt_fp16_speedup", "trt_int8_ms", "trt_int8_speedup_vs_pytorch", "trt_int8_speedup_vs_fp16"])
-            for bs, br in results["batch_sizes"].items():
-                writer.writerow([
-                    results["timestamp"], results["gpu"], bs,
-                    br.get("pytorch_bf16_ms", ""),
-                    br.get("trt_fp16_ms", ""),
-                    br.get("trt_fp16_speedup", ""),
-                    br.get("trt_int8_ms", ""),
-                    br.get("trt_int8_speedup_vs_pytorch", ""),
-                    br.get("trt_int8_speedup_vs_fp16", ""),
-                ])
-        print(f"\n  Results saved to: {out_path}")
+    out_path = os.path.join(TRT_OUTPUT_DIR, "benchmark_results.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "gpu", "batch_size", "pytorch_bf16_ms", "trt_fp16_ms", "trt_fp16_speedup", "trt_int8_ms", "trt_int8_speedup_vs_pytorch", "trt_int8_speedup_vs_fp16"])
+        writer.writerow([
+            timestamp, gpu, str(batch_size),
+            batch_results.get("pytorch_bf16_ms", ""),
+            batch_results.get("trt_fp16_ms", ""),
+            batch_results.get("trt_fp16_speedup", ""),
+            batch_results.get("trt_int8_ms", ""),
+            batch_results.get("trt_int8_speedup_vs_pytorch", ""),
+            batch_results.get("trt_int8_speedup_vs_fp16", ""),
+        ])
+    print(f"\n  Results saved to: {out_path}")
 
 
 def main():

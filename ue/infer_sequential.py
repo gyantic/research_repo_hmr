@@ -1,4 +1,4 @@
-"""Run in the SAT-HMR WSL environment; one source frame -> one UE ACK."""
+"""Sequential SAT-HMR inference launched by run_pipeline.py with the same Python; one source frame -> one UE ACK."""
 import argparse
 from fractions import Fraction
 import hashlib
@@ -8,7 +8,12 @@ import os
 from pathlib import Path
 import sys
 
+from source_checks import capture_properties,check_capture,check_source_stat,load_video_observations
+
 CACHE_VERSION=1
+IMAGE_SIZE=1288  # SAT-HMR input size (sat_644)
+CONFIDENCE=.3  # minimum detection confidence
+SEED=42
 SMPL_PARENTS=(-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19,20,21)
 
 def model_bone_lengths_m(joints):
@@ -34,11 +39,7 @@ def json_line(value):
     return json.dumps(value,separators=(',',':'),allow_nan=False)+'\n'
 
 def source_fingerprint(args,frame_count,fps):
-    stat=Path(args.source).stat()
-    if args.source_size is not None and stat.st_size!=args.source_size:
-        raise RuntimeError(f'Source size changed: expected {args.source_size}, found {stat.st_size}')
-    if args.source_mtime_ns is not None and stat.st_mtime_ns!=args.source_mtime_ns:
-        raise RuntimeError(f'Source mtime changed: expected {args.source_mtime_ns}, found {stat.st_mtime_ns}')
+    stat=check_source_stat(args.source,args.source_size,args.source_mtime_ns)
     return {'path':args.source_identity or str(Path(args.source).resolve()),'size':stat.st_size,
             'mtime_ns':stat.st_mtime_ns,'frame_count':frame_count,'fps':str(fps)}
 
@@ -86,17 +87,7 @@ def load_pose_cache(path):
     return metadata['source'],poses
 
 def load_observations(path,current_source):
-    if not path:return None
-    value=json.loads(Path(path).read_text(encoding='utf-8'))
-    if value.get('type')!='video_camera_observations' or value.get('version')!=1:
-        raise RuntimeError('Unsupported video camera observations')
-    source=value.get('source',{})
-    for key in ('path','size','mtime_ns','frame_count','fps'):
-        if source.get(key)!=current_source.get(key):raise RuntimeError('Video camera observation source mismatch: '+key)
-    intrinsics=value.get('intrinsics');frames=value.get('frames')
-    if not isinstance(intrinsics,list) or len(intrinsics)!=4 or not isinstance(frames,list) or len(frames)!=current_source['frame_count']:
-        raise RuntimeError('Invalid video camera observation dimensions')
-    return value
+    return load_video_observations(path,current_source) if path else None
 
 def replay_model_intrinsics(pose,observations):
     value=pose.get('model_intrinsics')
@@ -135,9 +126,6 @@ def main():
     parser.add_argument('--source-frame-count',type=int);parser.add_argument('--source-fps')
     parser.add_argument('--observations',help='Source-locked independent intrinsics and body12 observations')
     parser.add_argument('--inbox',required=True)
-    parser.add_argument('--image-size',type=int,default=1288)
-    parser.add_argument('--max-frames',type=int,default=0,help='Smoke only: composite against an equally trimmed source video')
-    parser.add_argument('--confidence',type=float,default=.3)
     parser.add_argument('--timeout',type=float,default=600)
     cache_group=parser.add_mutually_exclusive_group()
     cache_group.add_argument('--pose-cache',help='Atomically write a complete per-frame pose JSONL cache')
@@ -145,42 +133,41 @@ def main():
     parser.add_argument('--max-missing-frames',type=int,default=0,help='Hold the previous pose across this many consecutive missing detections')
     args=parser.parse_args()
     if args.max_missing_frames<0:parser.error('--max-missing-frames must be non-negative')
-    if args.pose_cache and args.max_frames:parser.error('--pose-cache cannot be combined with --max-frames')
-    if args.replay_poses and (args.max_frames or args.max_missing_frames):
-        parser.error('--max-frames/--max-missing-frames apply only to inference')
+    if args.replay_poses and args.max_missing_frames:
+        parser.error('--max-missing-frames applies only to inference')
     if args.replay_poses:return replay(args)
     sys.path.insert(0,args.sat_root);os.chdir(args.sat_root)
     import cv2
     import torch
-    import video_demo as vd
+    from models import build_sat_model
+    from sathmr_common import (dequantize_int8_weight_state_dict_if_needed,load_config,preprocess_frame,
+                               setup_reproducibility,smpl_pose_to_ue_quaternions)
     from pose_rendezvous import PoseRendezvous
-    config=vd.load_config(args.image_size)
-    model,_=vd.build_sat_model(config,set_criterion=False)
+    setup_reproducibility(SEED)  # same seed/determinism settings as sat-hmr/video_demo.py
+    config=load_config(IMAGE_SIZE)
+    model,_=build_sat_model(config,set_criterion=False)
     state=torch.load('weights/sat_hmr/sat_644.pth',map_location='cpu',weights_only=False)
-    state,_=vd.dequantize_int8_weight_state_dict_if_needed(state)
+    state,_=dequantize_int8_weight_state_dict_if_needed(state)
     model.load_state_dict(state,strict=False);model.cuda().eval()
     bridge=PoseRendezvous(args.inbox,args.timeout)
     video=cv2.VideoCapture(args.source)
     if not video.isOpened():raise RuntimeError('Cannot open source video')
-    count=int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps=Fraction(str(video.get(cv2.CAP_PROP_FPS))).limit_denominator(1000000)
-    if args.source_frame_count is not None and count!=args.source_frame_count:
-        raise RuntimeError(f'Source frame count changed: expected {args.source_frame_count}, found {count}')
-    if args.source_fps is not None and fps!=Fraction(args.source_fps):
-        raise RuntimeError(f'Source FPS changed: expected {args.source_fps}, found {fps}')
+    decoded=capture_properties(video)
+    check_capture(decoded,{'frame_count':args.source_frame_count,'fps':args.source_fps})
+    count,fps=decoded['frame_count'],decoded['fps']
     fingerprint=source_fingerprint(args,count,fps)
     observations=load_observations(args.observations,fingerprint)
     cache=PoseCacheWriter(args.pose_cache,fingerprint) if args.pose_cache else None
     previous_translation=None;last_packet=None;processed=0;missing_run=0;held_indices=[]
     try:
-        while not args.max_frames or processed<args.max_frames:
+        while True:
             ok,frame=video.read()
             if not ok:break
-            image,model_input_size,original_size=vd.preprocess_frame(frame,args.image_size)
+            image,model_input_size,original_size=preprocess_frame(frame,IMAGE_SIZE)
             with torch.inference_mode():
                 prediction=model([image.cuda()],[{'img_size':torch.tensor(model_input_size,device='cuda'),'img_path':'sample'}])
             confidence=prediction['pred_confs'][0].reshape(-1)
-            candidates=torch.nonzero(confidence>=args.confidence).reshape(-1)
+            candidates=torch.nonzero(confidence>=CONFIDENCE).reshape(-1)
             held=False
             if candidates.numel()==0:
                 missing_run+=1
@@ -201,7 +188,7 @@ def main():
                 intrinsic_matrix[0]*=original_size[1]/model_input_size[1];intrinsic_matrix[1]*=original_size[0]/model_input_size[0]
                 model_intrinsics=[float(intrinsic_matrix[0,0]),float(intrinsic_matrix[1,1]),float(intrinsic_matrix[0,2]),float(intrinsic_matrix[1,2])]
                 model_joints=prediction['pred_j3ds'][0][index][:24].cpu().tolist()
-                packet={'quaternions':vd.smpl_pose_to_ue_quaternions(pose).tolist(),
+                packet={'quaternions':smpl_pose_to_ue_quaternions(pose).tolist(),
                         'pelvis_camera_m':model_joints[0],
                         'model_bone_lengths_m':model_bone_lengths_m(model_joints),
                         'model_joints_camera_m':model_joints,
@@ -210,7 +197,6 @@ def main():
                 last_packet=packet
             if observations:
                 observed=observations['frames'][processed]
-                if observed.get('frame_index')!=processed:raise RuntimeError('Video camera observations are not contiguous')
                 packet['intrinsics']=observations['intrinsics']
                 packet['body_keypoints_2d']=observed['body12']
             bridge.submit(packet['quaternions'],packet['pelvis_camera_m'],packet['intrinsics'],
@@ -219,10 +205,9 @@ def main():
             if cache:cache.write_pose(processed,packet,held)
             processed+=1
             print(json.dumps({'acknowledged_frame':processed-1,'source_frames':count}),flush=True)
-        if not args.max_frames and processed!=count:raise RuntimeError(f'Decoded {processed} of {count} source frames')
+        if processed!=count:raise RuntimeError(f'Decoded {processed} of {count} source frames')
         bridge.finish()
         if cache:
-            if processed!=count:raise RuntimeError('Refusing to finalize a pose cache that does not cover the full source')
             if source_fingerprint(args,count,fps)!=fingerprint:raise RuntimeError('Source changed while pose cache was being produced')
             cache.finish(held_indices)
     finally:

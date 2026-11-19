@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from sam_3d_body.utils.quiet import quiet_print
+
 
 class HumanDetector:
     def __init__(self, name="vitdet", device="cuda", **kwargs):
@@ -291,8 +293,8 @@ def run_yolo_pose(
         inference_kwargs['classes'] = [det_cat_id]
 
     # Run YOLO-Pose inference
-    if is_engine and not os.environ.get("SAM3D_QUIET"):
-        print(f"          [DEBUG] YOLO-Pose using TensorRT engine")
+    if is_engine:
+        quiet_print(f"          [DEBUG] YOLO-Pose using TensorRT engine")
     results = detector(img, **inference_kwargs)
 
     boxes_list = []
@@ -345,8 +347,7 @@ def run_yolo_pose(
         boxes = boxes[sorted_indices]
         keypoints = keypoints[sorted_indices]
 
-    if not os.environ.get("SAM3D_QUIET"):
-        print(f"          [DEBUG] YOLO-Pose detected {len(boxes)} person(s)")
+    quiet_print(f"          [DEBUG] YOLO-Pose detected {len(boxes)} person(s)")
 
     # Return dict with boxes and keypoints
     return {

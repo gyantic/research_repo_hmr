@@ -24,8 +24,6 @@ class TRACE(nn.Module):
     def __init__(self, args):
         super(TRACE, self).__init__()
         load_config_dict(self, vars(args)) # loading settings to self.
-        self.results_save_dir = args.save_path
-        self.smpl_model_path = args.smpl_path  
         self.default_seq_cfgs = get_seq_cfgs(args)
         self.device = torch.device(f'cuda:{self.GPU}') if self.GPU>-1 else torch.device('cpu')
         print('putting data onto:', self.device)

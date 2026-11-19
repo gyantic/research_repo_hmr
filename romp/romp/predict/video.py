@@ -1,6 +1,4 @@
 import sys
-import time
-
 whether_set_yml = ['configs_yml' in input_arg for input_arg in sys.argv]
 if sum(whether_set_yml)==0:
     default_webcam_configs_yml = "--configs_yml=configs/video.yml"
@@ -73,13 +71,9 @@ class Video_processor(Image_processor):
             from visualization.vedo_visualizer import Vedo_visualizer
             visualizer = Vedo_visualizer()
             stand_on_imgs_frames = []
-        
-        mesh_generation_times = []  # seconds per net_forward call
 
         for test_iter,meta_data in enumerate(internet_loader):
-            start_time = time.time()
             outputs = self.net_forward(meta_data, cfg=self.demo_cfg)
-            mesh_generation_times.append(time.time() - start_time)
             reorganize_idx = outputs['reorganize_idx'].cpu().numpy()
             counter.count(self.val_batch_size)
             results = self.reorganize_results(outputs, outputs['meta_data']['imgpath'], reorganize_idx)
@@ -194,9 +188,6 @@ class Video_processor(Image_processor):
             video_save_name = os.path.join(self.output_dir, video_basename+'_soi_results.mp4')
             print('Writing results to {}'.format(video_save_name))
             frames2video(stand_on_imgs_frames, video_save_name, fps=self.fps_save)
-        mean_mesh_time_s = sum(mesh_generation_times) / len(mesh_generation_times)
-        print(f"メッシュ生成の平均時間: {mean_mesh_time_s:.4f}秒")
-        print(f"メッシュ生成の最大時間（ピーク）: {max(mesh_generation_times):.4f}秒")
         return results_frames
 
 

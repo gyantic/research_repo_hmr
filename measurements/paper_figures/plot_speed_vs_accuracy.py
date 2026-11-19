@@ -9,11 +9,14 @@ torch.compile ありの行だけを描き、エラーバーは 2×MAD。
 
 import argparse
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.ticker import NullFormatter, ScalarFormatter
 
 from plot_common import (SERIES_COLORS, SERIES_ORDER, add_common_args, is_quantized,
-                         load_plot_rows, np, pd, plt, save_figure)
+                         load_plot_rows, save_figure)
 
 METRICS = ["PA-MPJPE", "MPJPE", "PVE", "PA-PVE"]
 METRICS_WITHOUT_PAPER_VALUE = {"PA-PVE"}
@@ -35,7 +38,7 @@ LEG_STAR_SIZE = 13
 X_TICKS_MS = [5, 10, 15, 20, 30, 50, 70, 100, 150, 200, 300, 500, 700, 1000, 1500]
 
 
-def _axes_setup(ax, *, metric, title, rows=None, has_stars=False):
+def _axes_setup(ax, *, metric, title, rows, has_stars=False):
     ax.set_xscale("log")
     ax.invert_yaxis()
     ax.set_xlabel("inference time  (ms / frame, median)   —   ← faster", fontsize=19)
@@ -45,11 +48,6 @@ def _axes_setup(ax, *, metric, title, rows=None, has_stars=False):
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.tick_params(labelsize=18)
-
-    if rows is None or len(rows) == 0:
-        ax.set_xticks([10, 20, 50, 100, 200, 500, 1000])
-        ax.set_xticklabels(["10", "20", "50", "100", "200", "500", "1000"])
-        return
 
     # データに合わせて軸範囲を決める
     xerr_ms = rows["robust_infer_ms_mad"].fillna(0)

@@ -13,11 +13,21 @@ import torch.nn as nn
 import config
 from config import args
 from utils import print_dict
-if args().model_precision=='fp16':
-    from torch.cuda.amp import autocast
 
 BN_MOMENTUM = 0.1
 default_cfg = {'mode':'val', 'calc_loss': False}
+
+def apply_model_precision(model, precision):
+    """Cast the weights for args().model_precision; the only place model weights are cast.
+
+    bf16: the whole model. fp16: the backbone only (kept from the earlier fp16 path).
+    fp32: unchanged. The input is cast to match in Base.feed_forward.
+    """
+    if precision == 'bf16':
+        return model.to(torch.bfloat16)
+    if precision == 'fp16':
+        model.backbone.half()
+    return model
 
 class Base(nn.Module):
     def forward(self, meta_data, **cfg):
@@ -49,10 +59,9 @@ class Base(nn.Module):
 
     def feed_forward(self, meta_data):
         img = meta_data['image'].contiguous().cuda(non_blocking=True)
-        # No autocast: cast the input to the (first) parameter dtype for bf16/fp16 runs.
-        model_dtype = next(self.parameters()).dtype
-        if model_dtype != torch.float32:
-            img = img.to(model_dtype)
+        # No autocast: cast the input (uint8 or float32 image) to the dtype of the first
+        # parameter, i.e. the backbone weights (see apply_model_precision).
+        img = img.to(next(self.parameters()).dtype)
         x = self.backbone(img)
         outputs = self.head_forward(x)
         return outputs

@@ -3,7 +3,6 @@ import argparse
 from datetime import datetime
 from fractions import Fraction
 import json
-import math
 import os
 from pathlib import Path
 import shutil
@@ -11,11 +10,15 @@ import subprocess
 import sys
 import time
 
+from source_checks import load_video_observations
+
 HERE=Path(__file__).resolve().parent
 REPO_ROOT=HERE.parent
 PACKAGE_NAMES={'normal':'Normal','rockdrop':'RockDrop','orbit':'SphereOrbit'}
+SCENE_MODES=tuple(PACKAGE_NAMES)
 RESULTS_ROOT=REPO_ROOT/'results'/'ue'
 RECORDER_STARTUP_TIMEOUT_S=180
+RECORD_REPEAT=1  # recorded frames per source frame (runtime config and composite must agree)
 
 def executable(value):
     result=shutil.which(value)
@@ -104,76 +107,21 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 def validate_arguments(p,a):
     if a.max_missing_frames<0:p.error('--max-missing-frames must be non-negative')
     if a.replay_poses and a.max_missing_frames:p.error('--max-missing-frames applies only when inferring')
-    if a.postprocess_only and (a.pose_cache or a.replay_poses or a.max_missing_frames):
-        p.error('pose cache options cannot be combined with --postprocess-only')
-    if a.target_width_scale is not None and (not math.isfinite(a.target_width_scale) or a.target_width_scale<=0):p.error('--target-width-scale must be finite and positive')
-    if a.target_height_scale is not None and (not math.isfinite(a.target_height_scale) or a.target_height_scale<=0):p.error('--target-height-scale must be finite and positive')
-    if not math.isfinite(a.screen_up_pixels):p.error('--screen-up-pixels must be finite')
-    if not math.isfinite(a.screen_up_cm):p.error('--screen-up-cm must be finite')
-    if a.packaged_exe and a.postprocess_only:p.error('--packaged-exe cannot be combined with --postprocess-only')
-    if a.game_project and not a.packaged_exe:p.error('--game-project requires --packaged-exe pointing to UnrealEditor.exe')
-    if a.game_project and Path(a.game_project).suffix.lower()!='.uproject':p.error('--game-project must be a .uproject file')
-    if a.joint_diagnostics and not a.packaged_exe:p.error('--joint-diagnostics requires --packaged-exe')
-    if a.camera_calibration and not a.auto_camera:p.error('--camera-calibration requires --auto-camera')
-    if a.auto_camera and not a.packaged_exe:p.error('--auto-camera requires --packaged-exe')
-    if a.auto_camera and (a.screen_up_pixels!=0 or a.screen_up_cm!=0):p.error('--auto-camera requires zero screen-up offsets')
-    if a.auto_camera and (a.target_width_scale is not None or a.target_height_scale is not None):p.error('--auto-camera cannot be combined with target scale options')
-    if not a.packaged_exe and (a.target_width_scale is not None or a.target_height_scale is not None):p.error("target scale options require --packaged-exe")
-    if not a.packaged_exe and (a.screen_up_pixels!=0 or a.screen_up_cm!=0):p.error("screen-up offset options require --packaged-exe")
-    if not a.packaged_exe and not a.postprocess_only:
-        p.error('--packaged-exe is required for recording; this repository supports packaged recording only (ue/record.py is not included)')
 
-def auto_camera_inputs(a,source_path,source,out,summary):
-    """Return the runtime-config camera fields and record how the source intrinsics were validated."""
-    camera_runtime={'auto_camera_from_pose':True}
-    if a.camera_calibration:
-        from camera_calibration import validate_canonical,validate_source_identity
-        validated_runtime,camera_report=validate_canonical(source_path,Path(a.camera_calibration).resolve())
-        validate_source_identity(camera_report,source)
-        camera_runtime.update(validated_runtime)
-    else:
-        camera_report={'type':'auto_camera_input_validation','version':1,
-            'mode':'sat_hmr_pelvis_camera_translation','source':str(source_path),
-            'canonical_intrinsics_validated':False,'extrinsics_applied':False,
-            'description':'Source-video intrinsics are estimated independently. Camera position comes from SAT-HMR 3D translation after SAT-to-UE unit conversion and is not fitted to source joints.'}
+def auto_camera_inputs(source_path,out,summary):
+    """Return the runtime-config camera fields and record how the source intrinsics were obtained."""
+    camera_report={'type':'auto_camera_input_validation','version':1,
+        'mode':'sat_hmr_pelvis_camera_translation','source':str(source_path),
+        'canonical_intrinsics_validated':False,'extrinsics_applied':False,
+        'description':'Source-video intrinsics are estimated independently. Camera position comes from SAT-HMR 3D translation after SAT-to-UE unit conversion and is not fitted to source joints.'}
     summary['auto_camera_input_validation']=camera_report
     (out/'auto_camera_input_validation.json').write_text(json.dumps(camera_report,indent=2),encoding='utf-8')
-    return camera_runtime
+    return {'auto_camera_from_pose':True}
 
 def validate_auto_camera_ready(runtime):
     auto=runtime.get('auto_camera',{})
     if auto.get('enabled') is not True or auto.get('mode')!='sat_hmr_pelvis_camera_translation':
         raise RuntimeError('Recorder does not support pose-driven camera placement')
-
-def finite_numbers(values):
-    return all(isinstance(item,(int,float)) and math.isfinite(item) for item in values)
-
-def load_video_observations(path,source_path,source_stat,source):
-    value=json.loads(Path(path).read_text(encoding='utf-8'))
-    if value.get('type')!='video_camera_observations' or value.get('version')!=1:
-        raise RuntimeError('Unsupported video camera observations')
-    identity=value.get('source',{})
-    expected={'path':str(source_path),'size':source_stat.st_size,'mtime_ns':source_stat.st_mtime_ns,
-              'frame_count':source['frames'],'width':source['width'],'height':source['height']}
-    if any(identity.get(key)!=expected_value for key,expected_value in expected.items()):
-        raise RuntimeError('Video camera observation source identity mismatch')
-    if Fraction(identity.get('fps','0'))!=Fraction(source['fps']):
-        raise RuntimeError('Video camera observation FPS mismatch')
-    intrinsics=value.get('intrinsics')
-    if not isinstance(intrinsics,list) or len(intrinsics)!=4 or not finite_numbers(intrinsics) or intrinsics[0]<=0 or intrinsics[1]<=0:
-        raise RuntimeError('Video camera observations contain invalid intrinsics')
-    frames=value.get('frames')
-    if not isinstance(frames,list) or len(frames)!=source['frames']:
-        raise RuntimeError('Video camera observations do not cover the source')
-    for index,frame in enumerate(frames):
-        if not isinstance(frame,dict):raise RuntimeError('Video camera observation frame must be an object')
-        body=frame.get('body12')
-        if frame.get('frame_index')!=index or not isinstance(body,list) or len(body)!=12:
-            raise RuntimeError('Video camera observation frames are not contiguous body12 records')
-        for point in body:
-            if not isinstance(point,list) or len(point)!=3 or not finite_numbers(point) or not 0<=point[2]<=1:
-                raise RuntimeError('Video camera observations contain invalid body keypoints')
-    return value
 
 def wait_child(child,timeout_s,name):
     try:code=child.wait(timeout=timeout_s)
@@ -190,41 +138,31 @@ def prepare_output(out):
 
 def resolve_game(a):
     game=Path(a.packaged_exe).resolve()
-    if not a.game_project:
-        # Prefer the real game binary over the package-root bootstrap launcher when it is unambiguous.
-        nested=game.parent/'MyProject_ROMP'/'Binaries'/'Win64'
-        candidates=list(nested.glob('MyProject_ROMP*.exe')) if nested.is_dir() else []
-        if len(candidates)==1:game=candidates[0]
+    # Prefer the real game binary over the package-root bootstrap launcher when it is unambiguous.
+    nested=game.parent/'MyProject_ROMP'/'Binaries'/'Win64'
+    candidates=list(nested.glob('MyProject_ROMP*.exe')) if nested.is_dir() else []
+    if len(candidates)==1:game=candidates[0]
     if not game.is_file():raise FileNotFoundError(game)
-    project=Path(a.game_project).resolve() if a.game_project else None
-    if project and not project.is_file():raise FileNotFoundError(project)
-    return game,project
+    return game
 
-def runtime_config(a,source,raw,inbox,camera_runtime,out):
+def runtime_config(a,source,raw,inbox,camera_runtime):
     """Build the SampleVideoRecorder runtime config; its keys are validated by the packaged game."""
     rate=Fraction(source['fps'])
     config={'output':windows_path(raw),'inbox':windows_path(inbox),
             'ffmpeg':recorder_ffmpeg(a.recorder_ffmpeg),'width':source['width'],
             'height':source['height'],'fps_num':rate.numerator,'fps_den':rate.denominator,
-            'repeat':a.repeat,'timeout':a.frame_timeout,'camera_tag':'SAT_HMR_Perspective_FOV60',
+            'repeat':RECORD_REPEAT,'timeout':a.frame_timeout,'camera_tag':'SAT_HMR_Perspective_FOV60',
             'target_class':'BP_UDPBoneBasedReceiver1_C',
             'scene_mode':a.scene_mode,
-            'screen_up_pixels':a.screen_up_pixels,'screen_up_cm':a.screen_up_cm}
+            # No screen-up offset; the packaged game still expects both keys.
+            'screen_up_pixels':0.0,'screen_up_cm':0.0}
     if camera_runtime:config.update(camera_runtime)
-    if a.joint_diagnostics:config['joint_diagnostics_path']=windows_path(out/'ue_joints.jsonl')
-    if a.target_width_scale is not None or a.target_height_scale is not None:
-        scale=[a.target_width_scale or 1.0,1.0,a.target_height_scale or 1.0]
-        config['target_component_scales']={name:scale for name in ('SMPLcomp','ProcMesh','clothMesh','ClothMeshCompm')}
     return config
 
-def game_command(game,project,config_path,out):
-    command=[windows_path(game)]
-    if project:command.extend((windows_path(project),'/Game/NewMap2','-game'))
-    else:command.append('/Game/NewMap2')
-    command.extend(('-SampleVideoConfig='+windows_path(config_path),
-                    '-windowed','-ResX=1280','-ResY=720','-unattended','-nosplash',
-                    '-abslog='+windows_path(out/'game.log')))
-    return command
+def game_command(game,config_path,out):
+    return [windows_path(game),'/Game/NewMap2','-SampleVideoConfig='+windows_path(config_path),
+            '-windowed','-ResX=1280','-ResY=720','-unattended','-nosplash',
+            '-abslog='+windows_path(out/'game.log')]
 
 def wait_for_recorder_ready(recorder,out):
     deadline=time.monotonic()+RECORDER_STARTUP_TIMEOUT_S
@@ -285,33 +223,46 @@ def stop_recorder(recorder,out,windows_game_pid_file,config_path,summary):
     try:recorder.wait(timeout=10)
     except subprocess.TimeoutExpired:pass
 
+def absolute_path(path):
+    return str(Path(path).expanduser().resolve())
+
+def add_common_args(p):
+    """Add the options run_video.py exposes and forwards unchanged; return their actions for forward_common_args."""
+    actions=[
+        p.add_argument('--observation-python',default=sys.executable,
+                       help='Python used for camera observation (defaults to the active interpreter)'),
+        p.add_argument('--ffmpeg',default='ffmpeg',help='Native ffmpeg for probing and compositing'),
+        p.add_argument('--ffprobe',default='ffprobe',help='Native ffprobe for probing and validation'),
+        p.add_argument('--recorder-ffmpeg',help='Windows ffmpeg used by the Win64 Unreal package'),
+        p.add_argument('--timeout',type=float,default=7200),
+        p.add_argument('--frame-timeout',type=float,default=600),
+        p.add_argument('--max-missing-frames',type=int,default=0,
+                       help='Hold the last valid pose across this many consecutive detection misses')]
+    pose_group=p.add_mutually_exclusive_group()
+    actions.append(pose_group.add_argument('--pose-cache',type=absolute_path,
+                                           help='Write a complete reusable pose JSONL cache during SAT-HMR inference'))
+    actions.append(pose_group.add_argument('--replay-poses',type=absolute_path,
+                                           help='Replay a complete pose JSONL cache instead of running SAT-HMR'))
+    return actions
+
+def forward_common_args(a,actions):
+    """Turn the parsed add_common_args options back into command-line arguments for main()."""
+    argv=[]
+    for action in actions:
+        value=getattr(a,action.dest)
+        if value is not None:argv.extend((action.option_strings[0],str(value)))
+    return argv
+
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--packaged-exe',help='Cooked Win64 game executable; does not use Editor/Python remote control')
-    p.add_argument('--game-project',help='Run packaged-exe as UnrealEditor -game with this .uproject (development trials only)')
+    p.add_argument('--packaged-exe',required=True,help='Cooked Win64 game executable; does not use Editor/Python remote control')
     p.add_argument('--source',required=True)
-    p.add_argument('--output-dir');p.add_argument('--postprocess-only',action='store_true');p.add_argument('--recording')
-    p.add_argument('--repeat',type=int,default=6)
-    p.add_argument('--ffmpeg',default='ffmpeg');p.add_argument('--ffprobe',default='ffprobe')
-    p.add_argument('--recorder-ffmpeg',help='Windows ffmpeg executable used by the Win64 Unreal recorder')
-    p.add_argument('--observation-python',default=sys.executable,
-                   help='Python used for camera observation (defaults to the active interpreter)')
+    p.add_argument('--output-dir')
     p.add_argument('--sat-root',default=str(REPO_ROOT/'sat-hmr'),help='SAT-HMR checkout in this repository')
-    p.add_argument('--timeout',type=float,default=7200);p.add_argument('--frame-timeout',type=float,default=600)
-    pose_group=p.add_mutually_exclusive_group()
-    pose_group.add_argument('--pose-cache',help='Write a complete reusable pose JSONL cache during SAT-HMR inference')
-    pose_group.add_argument('--replay-poses',help='Replay a complete pose JSONL cache with Windows Python')
-    p.add_argument('--max-missing-frames',type=int,default=0,help='Hold the last valid pose across this many consecutive detection misses')
-    p.add_argument('--key-color');p.add_argument('--similarity',type=float,default=.12);p.add_argument('--blend',type=float,default=.04)
+    add_common_args(p)
     p.add_argument('--despill',action='store_true')
-    p.add_argument('--target-width-scale',type=float)
-    p.add_argument('--target-height-scale',type=float)
-    p.add_argument('--screen-up-pixels',type=float,default=0.0)
-    p.add_argument('--screen-up-cm',type=float,default=0.0)
-    p.add_argument('--joint-diagnostics',action='store_true',help='Write projected UE bone coordinates to output/ue_joints.jsonl')
     p.add_argument('--auto-camera',action='store_true',help='Estimate source intrinsics, then place the camera from converted 3D pose translation while keeping the CG actor fixed')
-    p.add_argument('--scene-mode',choices=('normal','rockdrop','orbit'),default='normal')
-    p.add_argument('--camera-calibration',help='Use an explicitly supplied calibration JSON instead of estimating intrinsics (requires --auto-camera)')
+    p.add_argument('--scene-mode',choices=SCENE_MODES,default='normal')
     a=p.parse_args(argv)
     validate_arguments(p,a)
     default_output=RESULTS_ROOT/PACKAGE_NAMES[a.scene_mode]/'Recordings'/datetime.now().strftime('%Y%m%d-%H%M%S-%f')
@@ -325,64 +276,62 @@ def main(argv=None):
         except FileExistsError:raise RuntimeError(f'Pipeline lock exists: {lock_path}. Finish the active run; remove it only after confirming no pipeline is running')
         os.write(lock_fd,str(os.getpid()).encode());os.close(lock_fd)
         prepare_output(out);output_ready=True
-        from postprocess import probe,ensure_cfr,process
+        from postprocess import KEY_BLEND,KEY_SIMILARITY,probe,ensure_cfr,process
         a.ffmpeg=executable(a.ffmpeg);a.ffprobe=executable(a.ffprobe)
         source=probe(a.source,a.ffprobe);ensure_cfr(a.source,source['fps'],a.ffprobe)
         summary['source']=source
         source_path=Path(a.source).resolve()
         source_stat=source_path.stat()
-        camera_runtime=auto_camera_inputs(a,source_path,source,out,summary) if a.auto_camera else None
+        camera_runtime=auto_camera_inputs(source_path,out,summary) if a.auto_camera else None
 
         observations_path=None
-        if a.auto_camera and not a.postprocess_only:
+        if a.auto_camera:
             observations_path=out/'video_camera_observations.json'
             observe=[executable(a.observation_python),str(HERE/'observe_video_camera.py'),
                      '--source',str(source_path),'--output',str(observations_path),'--source-identity',str(source_path),
                      '--source-size',str(source_stat.st_size),'--source-mtime-ns',str(source_stat.st_mtime_ns),
                      '--frame-count',str(source['frames']),'--width',str(source['width']),'--height',str(source['height']),
                      '--fps',str(source['fps'])]
-            if 'expected_intrinsics' in camera_runtime:
-                observe.extend(('--intrinsics',*(str(value) for value in camera_runtime['expected_intrinsics'])))
             summary['observation_command']=observe
             observation_log=open(out/'observation.log','w',encoding='utf-8');handles.append(observation_log)
             observation=subprocess.Popen(observe,stdout=observation_log,stderr=subprocess.STDOUT)
             children.append(observation);wait_child(observation,a.timeout,'Video camera observation')
-            observed=load_video_observations(observations_path,source_path,source_stat,source)
+            observed=load_video_observations(observations_path,{
+                'path':str(source_path),'size':source_stat.st_size,'mtime_ns':source_stat.st_mtime_ns,
+                'frame_count':source['frames'],'width':source['width'],'height':source['height'],'fps':source['fps']})
             camera_runtime['expected_intrinsics']=observed['intrinsics']
             summary['video_camera_observations']={key:value for key,value in observed.items() if key!='frames'}
 
-        if a.postprocess_only:
-            if not a.recording:raise ValueError('--postprocess-only requires --recording existing.avi')
-            raw=Path(a.recording).resolve()
+        raw=out/'raw.avi';inbox=out/'inbox'
+        game=resolve_game(a)
+        inbox.mkdir()
+        config_path=out/'runtime_config.json'
+        config_path.write_text(json.dumps(runtime_config(a,source,raw,inbox,camera_runtime)),encoding='utf-8')
+        command=game_command(game,config_path,out)
+        log=open(out/'recording.log','w',encoding='utf-8');handles.append(log)
+        if os.name=='nt':
+            recorder=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,cwd=game.parent)
         else:
-            raw=out/'raw.avi';inbox=out/'inbox'
-            game,project=resolve_game(a)
-            inbox.mkdir()
-            config_path=out/'runtime_config.json'
-            config_path.write_text(json.dumps(runtime_config(a,source,raw,inbox,camera_runtime,out)),encoding='utf-8')
-            command=game_command(game,project,config_path,out)
-            log=open(out/'recording.log','w',encoding='utf-8');handles.append(log)
-            if os.name=='nt':
-                recorder=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,cwd=game.parent)
-            else:
-                recorder,windows_game_pid_file,relay_command=launch_windows_game(
-                    command,windows_path(game.parent),out,log)
-            children.append(recorder)
-            summary['runtime']=wait_for_recorder_ready(recorder,out)
-            if summary['runtime'].get('scene_mode')!=a.scene_mode:
-                raise RuntimeError(f"Runtime scene mode mismatch: requested {a.scene_mode}, got {summary['runtime'].get('scene_mode')}")
-            if a.auto_camera:validate_auto_camera_ready(summary['runtime'])
-            infer=inference_command(a,source_path,source_stat,source,inbox,observations_path)
-            summary['record_command']=command;summary['inference_command']=infer
-            if os.name!='nt':summary['record_launcher']=relay_command
-            inference_log=open(out/'inference.log','w',encoding='utf-8');handles.append(inference_log)
-            inference=subprocess.Popen(infer,stdout=inference_log,stderr=subprocess.STDOUT);children.append(inference)
-            wait_for_inference(inference,recorder,out,a.timeout)
-            wait_child(inference,1,'Inference');wait_child(recorder,60,'Recorder')
+            recorder,windows_game_pid_file,relay_command=launch_windows_game(
+                command,windows_path(game.parent),out,log)
+        children.append(recorder)
+        summary['runtime']=wait_for_recorder_ready(recorder,out)
+        if summary['runtime'].get('scene_mode')!=a.scene_mode:
+            raise RuntimeError(f"Runtime scene mode mismatch: requested {a.scene_mode}, got {summary['runtime'].get('scene_mode')}")
+        if a.auto_camera:validate_auto_camera_ready(summary['runtime'])
+        infer=inference_command(a,source_path,source_stat,source,inbox,observations_path)
+        summary['record_command']=command;summary['inference_command']=infer
+        if os.name!='nt':summary['record_launcher']=relay_command
+        inference_log=open(out/'inference.log','w',encoding='utf-8');handles.append(inference_log)
+        inference=subprocess.Popen(infer,stdout=inference_log,stderr=subprocess.STDOUT);children.append(inference)
+        wait_for_inference(inference,recorder,out,a.timeout)
+        wait_child(inference,1,'Inference');wait_child(recorder,60,'Recorder')
 
         validate_recording_status(raw,source,summary)
-        a.recording=str(raw);a.output_dir=str(out/'composite')
-        summary['postprocess']=process(a,source)
+        composite=argparse.Namespace(source=a.source,recording=str(raw),output_dir=str(out/'composite'),
+                                     repeat=RECORD_REPEAT,key_color=None,similarity=KEY_SIMILARITY,blend=KEY_BLEND,
+                                     despill=a.despill,ffmpeg=a.ffmpeg,ffprobe=a.ffprobe)
+        summary['postprocess']=process(composite,source)
         summary['success']=True
         print('Completed: '+str(out/'composite'/'final.mp4'),flush=True)
     except BaseException as exc:

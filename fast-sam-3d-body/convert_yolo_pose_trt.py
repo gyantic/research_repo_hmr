@@ -14,7 +14,7 @@ import os
 CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "yolo")
 
 
-def convert_to_tensorrt(model_name: str, imgsz: int = 640, half: bool = True, int8: bool = False):
+def convert_to_tensorrt(model_name: str, imgsz: int = 640, half: bool = True):
     """
     Convert YOLO-Pose model to TensorRT format.
 
@@ -35,13 +35,11 @@ def convert_to_tensorrt(model_name: str, imgsz: int = 640, half: bool = True, in
     model = YOLO(model_name)
 
     # Export to TensorRT
-    print(f"Exporting to TensorRT (imgsz={imgsz}, half={half}, int8={int8})...")
+    print(f"Exporting to TensorRT (imgsz={imgsz}, half={half})...")
     output_path = model.export(
         format="engine",
         imgsz=imgsz,
         half=half,
-        int8=int8,
-        data=None,
         device=0,  # GPU 0
         simplify=True,
         workspace=4,  # GB
@@ -123,12 +121,6 @@ if __name__ == "__main__":
         help="Use FP32 instead of FP16"
     )
     parser.add_argument(
-        "--int8",
-        action="store_true",
-        default=False,
-        help="Enable INT8 quantization (speed test, random calibration)"
-    )
-    parser.add_argument(
         "--test-image",
         type=str,
         default="./notebook/images/dancing.jpg",
@@ -138,7 +130,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Convert
-    engine_path = convert_to_tensorrt(args.model, args.imgsz, args.half, args.int8)
+    engine_path = convert_to_tensorrt(args.model, args.imgsz, args.half)
 
     # Test
     test_engine(engine_path, args.test_image)

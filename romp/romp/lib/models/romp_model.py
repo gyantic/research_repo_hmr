@@ -32,10 +32,7 @@ class ROMP(Base):
         if not args().fine_tune and not args().eval:
             self.init_weights()
             self.backbone.load_pretrain_params()
-        if args().model_precision == 'fp16': #追加ブロック：fp16の場合
-            assert self.backbone is not None
-            self.backbone.half()
-            
+
     def generate_coordmaps(self, size, device):
         yy, xx = torch.meshgrid(torch.arange(size[0]), torch.arange(size[1]), indexing='ij')
         yy = yy.float().unsqueeze(0) / (size[0] - 1)
@@ -56,7 +53,7 @@ class ROMP(Base):
         x = torch.cat((x, coordmaps.repeat(x.shape[0],1,1,1)), dim=1)
 
 
-        params_maps = self.final_layers[1](x) #final_layers:ROMPの最後のレイヤー群
+        params_maps = self.final_layers[1](x)
         center_maps = self.final_layers[2](x)
         if args().merge_smpl_camera_head:
             cam_maps, params_maps = params_maps[:,:3], params_maps[:,3:]

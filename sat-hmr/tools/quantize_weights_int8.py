@@ -3,8 +3,8 @@
 Weight-only INT8 quantization for SAT-HMR .pth files.
 
 Quantizes Linear weights to INT8 (per-channel) to reduce file size (~half).
-The quantized .pth can be loaded with load_quantized_state_dict() below,
-which dequantizes weights before loading into the model.
+video_demo.py / main.py dequantize such a .pth on load
+(sathmr_common.dequantize_int8_weight_state_dict_if_needed).
 
 Usage:
     # Quantize
@@ -70,12 +70,6 @@ def dequantize_state_dict(quant_dict: dict) -> dict:
         elif not key.endswith(".weight_scale"):
             state_dict[key] = tensor
     return state_dict
-
-
-def load_quantized_state_dict(path: str | pathlib.Path, map_location="cpu") -> dict:
-    """Load a quantized .pth and return a dequantized state dict ready for model.load_state_dict()."""
-    quant_dict = torch.load(path, map_location=map_location, weights_only=True)
-    return dequantize_state_dict(quant_dict)
 
 
 def file_size_mb(path: pathlib.Path) -> float:

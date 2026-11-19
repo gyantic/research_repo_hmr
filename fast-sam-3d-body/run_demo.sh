@@ -2,12 +2,6 @@
 # SAM 3D Body run script with optimized environment variables
 
 # ============================================================
-# Persistent torch.compile / triton cache (survives reboots)
-# ============================================================
-export TORCHINDUCTOR_CACHE_DIR=$HOME/.cache/torchinductor
-export TRITON_CACHE_DIR=$HOME/.cache/triton
-
-# ============================================================
 # Core Performance
 # ============================================================
 export GPU_HAND_PREP=1              # GPU hand preprocessing (faster)
@@ -30,7 +24,7 @@ export COMPILE_WARMUP_BATCH_SIZES=1  # Warmup batch sizes
 # ============================================================
 # CUDA Graph
 # ============================================================
-export MHR_USE_CUDA_GRAPH=1         # MHR CUDA Graph (0=off, 1=on)
+export MHR_USE_CUDA_GRAPH=0         # MHR CUDA Graph (0=off, 1=on)
 
 # ============================================================
 # Intermediate Layer Prediction
@@ -65,8 +59,8 @@ export FOV_LEVEL=0                  # Resolution level: 0-9 (0=1200 tokens, 9=36
 # ============================================================
 # Backbone TensorRT (DINOv3) - requires engine file
 # ============================================================
-export USE_TRT_BACKBONE=1
-export TRT_BACKBONE_PATH=./checkpoints/sam-3d-body-dinov3/backbone_trt/backbone_dinov3_fp16.engine
+# export USE_TRT_BACKBONE=1
+# export TRT_BACKBONE_PATH=./checkpoints/sam-3d-body-dinov3/backbone_trt/backbone_dinov3_fp16.engine
 
 # ============================================================
 # Decoder

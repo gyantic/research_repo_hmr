@@ -34,7 +34,6 @@ os.environ.setdefault("MHR_NO_CORRECTIVES", "1")
 os.environ.setdefault("IMG_SIZE", "512")
 
 import argparse
-import csv
 import json
 import pickle
 import sys
@@ -201,67 +200,6 @@ def adjust_cam_int_for_crop(cam_int, transform_info):
     return new_cam_int
 
 
-def _find_next_ann_idx_after(annotations, sample_path, fallback_idx):
-    """Index of the annotation following the one saved in ``sample_path``.
-
-    Falls back to ``fallback_idx`` when the sample cannot be read or matched.
-    """
-    try:
-        last_data = np.load(sample_path, allow_pickle=True)
-        last_key = (
-            str(last_data["sequence"]),
-            int(last_data["frame_idx"]),
-            int(last_data["person_idx"]),
-        )
-        for idx, ann in enumerate(annotations):
-            ann_key = (ann["sequence"], int(ann["frame_idx"]), int(ann["person_idx"]))
-            if ann_key == last_key:
-                return idx + 1
-    except Exception:
-        pass
-    return fallback_idx
-
-
-def resolve_resume_position(annotations, samples_dir, resume_state_json):
-    """Return (start_ann_idx, sample_idx) for --resume.
-
-    Two sources are considered and the one that is further along wins:
-      1. ``processed_count`` in resume_state_json (survives deleted samples).
-      2. The last sample_*.npz in samples_dir.
-    """
-    start_ann_idx, sample_idx = 0, 0
-
-    if resume_state_json and Path(resume_state_json).exists():
-        try:
-            with open(resume_state_json, "r") as f:
-                resume_state = json.load(f)
-            processed_count = int(resume_state.get("processed_count", 0))
-            if processed_count > 0:
-                start_ann_idx = sample_idx = processed_count
-                print(
-                    f"[RESUME] Using state {resume_state_json}; "
-                    f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
-                )
-        except Exception as exc:
-            print(f"[RESUME] Could not read state {resume_state_json}: {exc}")
-
-    existing_samples = sorted(samples_dir.glob("sample_*.npz"))
-    if not existing_samples:
-        return start_ann_idx, sample_idx
-
-    last_sample = existing_samples[-1]
-    next_sample_idx = int(last_sample.stem.split("_")[-1]) + 1
-    next_ann_idx = _find_next_ann_idx_after(annotations, last_sample, next_sample_idx)
-    if next_ann_idx > start_ann_idx:
-        start_ann_idx = next_ann_idx
-        sample_idx = next_sample_idx
-    print(
-        f"[RESUME] Found {len(existing_samples)} samples; "
-        f"continuing at ann_idx={start_ann_idx}, sample_idx={sample_idx}"
-    )
-    return start_ann_idx, sample_idx
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", required=True, help="Path to 3DPW dataset root")
@@ -282,10 +220,6 @@ def main():
                         help="Factor to expand bbox for cropping (1.5 = 50% padding)")
     parser.add_argument("--warmup_pass", action="store_true",
                         help="Run a full pass over the dataset for warmup, then run a second pass to record timing")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume from existing sample_*.npz files in output_dir/samples")
-    parser.add_argument("--resume_state_json", default="",
-                        help="Optional stream metrics state JSON with processed_count for resume after sample deletion")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -368,15 +302,10 @@ def main():
 
     print(f"Running single-person inference on {len(annotations)} samples...")
     print(f"Context factor: {args.context_factor}")
-    start_ann_idx, sample_idx = 0, 0
-    if args.resume:
-        start_ann_idx, sample_idx = resolve_resume_position(
-            annotations, samples_dir, args.resume_state_json
-        )
+    sample_idx = 0
     inference_times = []
-    timing_rows = []
 
-    for ann_idx, gt in enumerate(annotations[start_ann_idx:], start=start_ann_idx):
+    for ann_idx, gt in enumerate(annotations):
         img_path = gt['image_path']
         full_path = img_dir / img_path
         if not full_path.exists():
@@ -408,7 +337,6 @@ def main():
 
         try:
             # Run inference on cropped image
-            estimator.last_timings = {}
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             start_time = time.time()
@@ -422,21 +350,6 @@ def main():
                 torch.cuda.synchronize()
             inference_time = (time.time() - start_time) * 1000  # ms
             inference_times.append(inference_time)
-            timings = dict(getattr(estimator, "last_timings", {}) or {})
-            timing_rows.append({
-                "ann_idx": ann_idx,
-                "sample_idx": sample_idx,
-                "sequence": gt["sequence"],
-                "frame_idx": gt["frame_idx"],
-                "person_idx": gt["person_idx"],
-                "persons": len(preds) if preds else 0,
-                "detection_ms": timings.get("detection_ms", ""),
-                "fov_ms": timings.get("fov_ms", ""),
-                "inference_ms": timings.get("model_ms", ""),  # model.run_inference only
-                "backbone_ms": timings.get("backbone_ms", ""),
-                "decoders_ms": timings.get("decoders_ms", ""),
-                "total_ms": inference_time,
-            })
         except Exception as e:
             print(f"Error on sample {ann_idx}: {e}")
             continue
@@ -477,14 +390,6 @@ def main():
         temp_crop_path.unlink()
 
     # Save timing stats
-    if timing_rows:
-        timing_csv = output_dir / "timing_raw.csv"
-        with open(timing_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(timing_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(timing_rows)
-        print(f"Saved timing raw CSV to {timing_csv}")
-
     if inference_times:
         timing_stats = {
             'avg_inference_time_ms': float(np.mean(inference_times)),

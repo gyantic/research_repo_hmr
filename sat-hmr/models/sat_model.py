@@ -308,32 +308,6 @@ class Model(nn.Module):
         B = len(samples)
         C = self.encoder.embed_dim
         cr_token_list = [self.encoder_cr_token]*len(samples)
-        profile_count = int(getattr(self, '_sat_profile_forward_count', 0))
-        profile_limit = int(getattr(self, '_sat_profile_forward_limit', 0))
-        profile_encoder = (
-            bool(getattr(self, '_sat_profile_forward', False))
-            and not self.training
-            and (profile_limit <= 0 or profile_count < profile_limit)
-        )
-        enc_marks = []
-        enc_device = samples[0].device if isinstance(samples, list) and samples else None
-        profile_encoder_blocks = profile_encoder and bool(getattr(self, '_sat_profile_encoder_blocks', False))
-        prev_encoder_block_profile = getattr(self.encoder, '_sat_profile_blocks', False)
-        prev_encoder_block_forward = getattr(self.encoder, '_sat_profile_forward_index', 0)
-        prev_encoder_block_segment = getattr(self.encoder, '_sat_profile_segment', '')
-        if profile_encoder_blocks:
-            self.encoder._sat_profile_blocks = True
-            self.encoder._sat_profile_forward_index = profile_count
-        if profile_encoder:
-            def _enc_mark(name):
-                if enc_device is not None and enc_device.type == 'cuda':
-                    torch.cuda.synchronize(enc_device)
-                #enc_marks.append((name, time.perf_counter()))
-            _enc_mark('start')
-        else:
-            def _enc_mark(name):
-                return None
-        enc_profile_extra = {}
 
         if not self.use_sat:
             # img2token
@@ -367,7 +341,6 @@ class Model(nn.Module):
             scale_map_dict = None
             # also create lvl_list for patch visualization
             lvl_list = [torch.zeros_like(pos,dtype=int) for pos in pos_x_list]
-            _enc_mark('patch_tokens')
 
         else:
             lvl1_feature_hw = [(img.shape[1]//(2*self.patch_size), img.shape[2]//(2*self.patch_size)) for img in samples]
@@ -418,16 +391,12 @@ class Model(nn.Module):
             lvl1_pos_embed = torch.cat([full_pos_embed[ys,xs]\
                                         for (ys,xs) in zip(lvl1_pos_y.split(lvl1_token_lens), lvl1_pos_x.split(lvl1_token_lens))], dim=0)
             lvl1_tokens = lvl1_tokens + lvl1_pos_embed
-            _enc_mark('lvl1_patch')
 
             # get scale map (flattened)
             x_list = [torch.cat([cr, lvl1],dim=0).unsqueeze(0)\
                                  for (cr, lvl1) \
                                  in zip(cr_token_list, lvl1_tokens.split(lvl1_token_lens))]
-            if profile_encoder_blocks:
-                self.encoder._sat_profile_segment = 'scale_map'
             scale_map, updated_cr_list, updated_lvl1 = self.get_scale_map(x_list)
-            _enc_mark('scale_map')
             # for visualization
             scale_map_dict = {'scale_map': scale_map, 'lens': lvl1_token_lens, 'hw': lvl1_feature_hw,
                               'pos_y': lvl1_pos_y, 'pos_x': lvl1_pos_x}
@@ -437,263 +406,170 @@ class Model(nn.Module):
             if use_gt:
                 scale_map = torch.cat([tgt['scale_map'].view(-1,2) for tgt in targets], dim=0)
 
-            # Export-safe SAT path:
-            # keep SAT enabled, but replace hard boolean token selection with soft gating to
-            # avoid NonZero-driven dynamic shape ops that block strict INT8 build.
-            export_soft_sat = torch.onnx.is_in_onnx_export() and self.sat_cfg['num_lvls'] == 2
+            lvl1_valid_mask = scale_map[:,0] > conf_thresh
+            lvl1_sat_mask = lvl1_valid_mask & (scale_map[:,1] < scale_thresh)
+        
+            # prepare sat tokens (lvl0)
+            lvl0_token_lens = [msk.sum().item()<<2 for msk in lvl1_sat_mask.split(lvl1_token_lens)]
+            sat_idx = lvl1_sat_mask.nonzero(as_tuple=True)[0]
+            sat_n = sat_idx.size(0)
+            torch._check_is_size(sat_n)
+            # dummy sentinel を sat_idx に直接 1 個 padding することで、index_select 後の
+            # サイズが必ず sat_n + 1 (>= 1) になる。reshape 前で dummy を落とさないことで
+            # M = sat_n + 1 が shape 計算に入り、sat_n=0 でも M=1 で安全。
+            sat_idx_pad = torch.cat([sat_idx, sat_idx.new_zeros(1)], dim=0)
+            lvl1_sat_patches_28 = lvl1_img_patches_28.index_select(0, sat_idx_pad)  # (sat_n+1, 3, 28, 28)
+            # encoder_patch_proj[0] は patch_size=14 で 28x28 入力に対し (N, 768, 2, 2) を返す。
+            # 4 つの空間位置を整数 indexing で取り出して stack することで「空間 4 個」を
+            # Dynamo に hard-code で伝える (s7/s8 dynamic shape 経路を回避)。
+            _proj_out = self.encoder_patch_proj[0](lvl1_sat_patches_28)  # (sat_n+1, 768, 2, 2)
+            M = _proj_out.shape[0]
+            torch._check_is_size(M)
+            lvl0_tokens = torch.stack(
+                [
+                    _proj_out[:, :, 0, 0],
+                    _proj_out[:, :, 0, 1],
+                    _proj_out[:, :, 1, 0],
+                    _proj_out[:, :, 1, 1],
+                ],
+                dim=1,
+            )  # (sat_n+1, 4, 768)
+            lvl0_tokens = self.encoder_patch_norm[0](lvl0_tokens)
+            lvl0_tokens = lvl0_tokens.reshape(M * 4, lvl0_tokens.shape[-1])
+            lvl0_tokens = lvl0_tokens[:-4]
 
-            if export_soft_sat:
-                # Prepare lvl0 tokens from all lvl1 patches (dense), then gate by SAT confidence/scale.
-                lvl0_token_lens = [int(lvl_len) << 2 for lvl_len in lvl1_token_lens]
-                lvl0_tokens = self.encoder_patch_norm[0](
-                    self.encoder_patch_proj[0](lvl1_img_patches_28).permute(0, 2, 3, 1).flatten(0, 2)
-                )
+            assert len(lvl0_tokens) == sum(lvl0_token_lens)
+            # lvl0 positions
+            lvl0_pos_y = lvl1_pos_y.index_select(0, sat_idx)
+            lvl0_pos_x = lvl1_pos_x.index_select(0, sat_idx)
+            lvl0_pos_y = (lvl0_pos_y<<1)[:,None].repeat(1,4).flatten()
+            lvl0_pos_x = (lvl0_pos_x<<1)[:,None].repeat(1,4).flatten()
+            lvl0_pos_y[2::4] += 1
+            lvl0_pos_y[3::4] += 1
+            lvl0_pos_x[1::2] += 1
+            assert len(lvl0_pos_x) == len(lvl0_tokens)
 
-                # Use arithmetic multiply for ONNX-export stability (avoids Pow->Cast int64 chain from bit-shift).
-                lvl0_pos_y = (lvl1_pos_y * 2)[:, None].repeat(1, 4).flatten()
-                lvl0_pos_x = (lvl1_pos_x * 2)[:, None].repeat(1, 4).flatten()
-                lvl0_pos_y[2::4] += 1
-                lvl0_pos_y[3::4] += 1
-                lvl0_pos_x[1::2] += 1
+            # lvl0 pos_embed
+            full_pos_embed = self.encoder_pos_embeds
+            lvl0_pos_embed = torch.cat([full_pos_embed[ys,xs]\
+                                        for (ys,xs) in zip(lvl0_pos_y.split(lvl0_token_lens), lvl0_pos_x.split(lvl0_token_lens))], dim=0)
+            lvl0_tokens = lvl0_tokens + lvl0_pos_embed
 
-                full_pos_embed = self.encoder_pos_embeds
-                lvl0_pos_embed = torch.cat(
-                    [full_pos_embed[ys, xs] for (ys, xs) in zip(lvl0_pos_y.split(lvl0_token_lens), lvl0_pos_x.split(lvl0_token_lens))],
-                    dim=0,
-                )
-                lvl0_tokens = lvl0_tokens + lvl0_pos_embed
 
-                x_list = [
-                    torch.cat([cr, lvl0], dim=0).unsqueeze(0)
-                    for (cr, lvl0) in zip(cr_token_list, lvl0_tokens.split(lvl0_token_lens))
-                ]
-                x_list = self.encoder.forward_specific_layers_list(
-                    x_list, end=self.sat_cfg['get_map_layer'], get_feature=False
-                )
-                lvl0_tokens = torch.cat(
-                    [x[:, 1 + self.encoder.num_register_tokens :, :].squeeze(0) for x in x_list], dim=0
-                )
+            # update tokens
+            x_list = [torch.cat([cr, lvl0],dim=0).unsqueeze(0)\
+                            for (cr, lvl0) \
+                            in zip(cr_token_list, lvl0_tokens.split(lvl0_token_lens))]
+            x_list = self.encoder.forward_specific_layers_list(x_list, end=self.sat_cfg['get_map_layer'], get_feature=False)
+            lvl0_tokens = _drop_register_tokens_concat(x_list, self.encoder.num_register_tokens)
+            assert len(lvl0_pos_x) == len(lvl0_tokens)
+            # also update lvl1 and crs
+            lvl1_tokens = updated_lvl1
+            cr_token_list = updated_cr_list
 
-                lvl1_tokens = updated_lvl1
-                cr_token_list = updated_cr_list
+            
 
-                sat_conf = torch.sigmoid((scale_map[:, 0] - conf_thresh) * 8.0).to(dtype=lvl1_tokens.dtype)
-                sat_scale = torch.sigmoid((scale_thresh - scale_map[:, 1]) * 8.0).to(dtype=lvl1_tokens.dtype)
-                sat_weight = sat_conf * sat_scale
+            if self.sat_cfg['num_lvls'] == 2:
+                # drop corresponding lvl1 tokens
+                lvl1_keep = ~lvl1_sat_mask
+                lvl1_token_lens = [msk.sum().item() for msk in lvl1_keep.split(lvl1_token_lens)]
+                lvl1_keep_idx = lvl1_keep.nonzero(as_tuple=True)[0]
+                torch._check_is_size(lvl1_keep_idx.size(0))
+                lvl1_tokens = lvl1_tokens.index_select(0, lvl1_keep_idx)
+                lvl1_pos_y = lvl1_pos_y.index_select(0, lvl1_keep_idx)
+                lvl1_pos_x = lvl1_pos_x.index_select(0, lvl1_keep_idx)
 
-                lvl0_weight = sat_weight.repeat_interleave(4).to(dtype=lvl0_tokens.dtype)
-                lvl1_weight = (1.0 - sat_weight).to(dtype=lvl1_tokens.dtype)
-                lvl0_tokens = lvl0_tokens * lvl0_weight[:, None]
-                lvl1_tokens = lvl1_tokens * lvl1_weight[:, None]
-
+                # normalize positions
                 lvl0_pos_y_norm = (lvl0_pos_y.to(dtype=lvl0_tokens.dtype) + 0.5) / self.feature_size[0]
                 lvl0_pos_x_norm = (lvl0_pos_x.to(dtype=lvl0_tokens.dtype) + 0.5) / self.feature_size[0]
                 lvl1_pos_y_norm = (lvl1_pos_y.to(dtype=lvl1_tokens.dtype) + 0.5) / self.feature_size[1]
                 lvl1_pos_x_norm = (lvl1_pos_x.to(dtype=lvl1_tokens.dtype) + 0.5) / self.feature_size[1]
 
-                x_list = [
-                    torch.cat([cr, lvl0, lvl1]).unsqueeze(0)
-                    for cr, lvl0, lvl1 in zip(
-                        cr_token_list, lvl0_tokens.split(lvl0_token_lens), lvl1_tokens.split(lvl1_token_lens)
-                    )
-                ]
-                pos_y_list = [
-                    torch.cat([lvl0, lvl1])
-                    for lvl0, lvl1 in zip(
-                        lvl0_pos_y_norm.split(lvl0_token_lens), lvl1_pos_y_norm.split(lvl1_token_lens)
-                    )
-                ]
-                pos_x_list = [
-                    torch.cat([lvl0, lvl1])
-                    for lvl0, lvl1 in zip(
-                        lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens)
-                    )
-                ]
-                lvl_list = [
-                    torch.cat([torch.zeros_like(lvl0, dtype=int), torch.ones_like(lvl1, dtype=int)])
-                    for lvl0, lvl1 in zip(
-                        lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens)
-                    )
-                ]
+                # merge all
+                x_list = [torch.cat([cr, lvl0, lvl1]).unsqueeze(0) \
+                                for cr, lvl0, lvl1 \
+                                in zip(cr_token_list, lvl0_tokens.split(lvl0_token_lens), lvl1_tokens.split(lvl1_token_lens))]
+                pos_y_list = [torch.cat([lvl0, lvl1]) \
+                                    for lvl0, lvl1 \
+                                    in zip(lvl0_pos_y_norm.split(lvl0_token_lens), lvl1_pos_y_norm.split(lvl1_token_lens))]
+                pos_x_list = [torch.cat([lvl0, lvl1]) \
+                                    for lvl0, lvl1 \
+                                    in zip(lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens))]
+                lvl_list = [torch.cat([torch.zeros_like(lvl0, dtype=int), torch.ones_like(lvl1, dtype=int)]) \
+                                    for lvl0, lvl1 \
+                                    in zip(lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens))]
+
 
             else:
-                lvl1_valid_mask = scale_map[:,0] > conf_thresh
-                lvl1_sat_mask = lvl1_valid_mask & (scale_map[:,1] < scale_thresh)
-                if profile_encoder:
-                    enc_profile_extra['lvl1_total'] = int(lvl1_sat_mask.numel())
-                    enc_profile_extra['lvl1_valid'] = int(lvl1_valid_mask.sum().item())
-                    enc_profile_extra['lvl1_sat'] = int(lvl1_sat_mask.sum().item())
+                # prune lvl1 correspond to lvl0
+                lvl1_valid_mask = self.pad_mask(lvl1_valid_mask)
+                lvl1_keep = lvl1_valid_mask & (~lvl1_sat_mask)
+                lvl1_to_lvl2 = ~lvl1_valid_mask
+
+                token_lvls = [lvl0_tokens, lvl1_tokens]
+                token_lens_lvls = [lvl0_token_lens, lvl1_token_lens]
+                pos_y_lvls = [lvl0_pos_y, lvl1_pos_y]
+                pos_x_lvls = [lvl0_pos_x, lvl1_pos_x]
+
+                to_next_lvl = lvl1_to_lvl2
+                keep = lvl1_keep
+                lvl_zorders = lvl1_zorders
+                lvl_bids = lvl1_bids
+                pad_vals = torch.full((3,), -1, dtype=lvl_zorders.dtype, device=lvl_zorders.device)
+                for lvl in range(self.sat_cfg['num_lvls']-2):
+                    # if to_next_lvl.sum() == 0:
+                    #     break
+                    next_idx = to_next_lvl.nonzero(as_tuple=True)[0]
+                    keep_idx = keep.nonzero(as_tuple=True)[0]
+                    torch._check_is_size(next_idx.size(0))
+                    torch._check_is_size(keep_idx.size(0))
+                    next_tokens = self.lvl_pooling(token_lvls[-1].index_select(0, next_idx))
+                    # next_tokens = torch.max(token_lvls[-1][to_next_lvl].view(-1,4,C), dim=1)[0]
+                    next_pos_y = pos_y_lvls[-1].index_select(0, next_idx)[::4]>>1
+                    next_pos_x = pos_x_lvls[-1].index_select(0, next_idx)[::4]>>1
+                    next_lens = [msk.sum().item()//4 for msk in to_next_lvl.split(token_lens_lvls[-1])]
+
+
+                    token_lvls[-1] = token_lvls[-1].index_select(0, keep_idx)
+                    pos_y_lvls[-1] = pos_y_lvls[-1].index_select(0, keep_idx)
+                    pos_x_lvls[-1] = pos_x_lvls[-1].index_select(0, keep_idx)
+                    token_lens_lvls[-1] = [msk.sum().item() for msk in keep.split(token_lens_lvls[-1])]
+
+                    token_lvls.append(next_tokens)
+                    token_lens_lvls.append(next_lens)
+                    pos_y_lvls.append(next_pos_y)
+                    pos_x_lvls.append(next_pos_x)
+
+                    if lvl < self.sat_cfg['num_lvls']-3:
+                        lvl_zorders = lvl_zorders.index_select(0, next_idx)[::4]>>2
+                        lvl_bids = lvl_bids.index_select(0, next_idx)[::4]
+
+                        z_starts_idx = torch.where((lvl_zorders&3)==0)[0]
+                        padded_z = torch.cat([lvl_zorders, pad_vals])
+                        padded_bids = torch.cat([lvl_bids, pad_vals])
+                        valids = (padded_z[z_starts_idx] + 3 == padded_z[z_starts_idx + 3]) & (padded_bids[z_starts_idx] == padded_bids[z_starts_idx + 3])
+                        valid_starts = z_starts_idx[valids]
+                    
+                        to_next_lvl = torch.zeros_like(lvl_zorders, dtype=bool)
+                        to_next_lvl[valid_starts] = True
+                        to_next_lvl[valid_starts+1] = True
+                        to_next_lvl[valid_starts+2] = True
+                        to_next_lvl[valid_starts+3] = True
+
+                        keep = ~to_next_lvl
+
+                norm_pos_y_lvls = _normalize_pos_per_lvl(pos_y_lvls, lvl0_tokens.dtype, self.feature_size)
+                norm_pos_x_lvls = _normalize_pos_per_lvl(pos_x_lvls, lvl0_tokens.dtype, self.feature_size)
+
+                x_list = _build_x_list_multi(cr_token_list, token_lvls, token_lens_lvls)
+                pos_y_list = _build_pos_list_multi(norm_pos_y_lvls, token_lens_lvls)
+                pos_x_list = _build_pos_list_multi(norm_pos_x_lvls, token_lens_lvls)
+                lvl_list = _build_lvl_id_list_multi(norm_pos_x_lvls, token_lens_lvls)
+
             
-                # prepare sat tokens (lvl0)
-                lvl0_token_lens = [msk.sum().item()<<2 for msk in lvl1_sat_mask.split(lvl1_token_lens)]
-                if profile_encoder:
-                    enc_profile_extra['lvl0_tokens'] = int(sum(lvl0_token_lens))
-                sat_idx = lvl1_sat_mask.nonzero(as_tuple=True)[0]
-                sat_n = sat_idx.size(0)
-                torch._check_is_size(sat_n)
-                # dummy sentinel を sat_idx に直接 1 個 padding することで、index_select 後の
-                # サイズが必ず sat_n + 1 (>= 1) になる。reshape 前で dummy を落とさないことで
-                # M = sat_n + 1 が shape 計算に入り、sat_n=0 でも M=1 で安全。
-                sat_idx_pad = torch.cat([sat_idx, sat_idx.new_zeros(1)], dim=0)
-                lvl1_sat_patches_28 = lvl1_img_patches_28.index_select(0, sat_idx_pad)  # (sat_n+1, 3, 28, 28)
-                # encoder_patch_proj[0] は patch_size=14 で 28x28 入力に対し (N, 768, 2, 2) を返す。
-                # 4 つの空間位置を整数 indexing で取り出して stack することで「空間 4 個」を
-                # Dynamo に hard-code で伝える (s7/s8 dynamic shape 経路を回避)。
-                _proj_out = self.encoder_patch_proj[0](lvl1_sat_patches_28)  # (sat_n+1, 768, 2, 2)
-                M = _proj_out.shape[0]
-                torch._check_is_size(M)
-                lvl0_tokens = torch.stack(
-                    [
-                        _proj_out[:, :, 0, 0],
-                        _proj_out[:, :, 0, 1],
-                        _proj_out[:, :, 1, 0],
-                        _proj_out[:, :, 1, 1],
-                    ],
-                    dim=1,
-                )  # (sat_n+1, 4, 768)
-                lvl0_tokens = self.encoder_patch_norm[0](lvl0_tokens)
-                lvl0_tokens = lvl0_tokens.reshape(M * 4, lvl0_tokens.shape[-1])
-                lvl0_tokens = lvl0_tokens[:-4]
-
-                assert len(lvl0_tokens) == sum(lvl0_token_lens)
-                # lvl0 positions
-                lvl0_pos_y = lvl1_pos_y.index_select(0, sat_idx)
-                lvl0_pos_x = lvl1_pos_x.index_select(0, sat_idx)
-                lvl0_pos_y = (lvl0_pos_y<<1)[:,None].repeat(1,4).flatten()
-                lvl0_pos_x = (lvl0_pos_x<<1)[:,None].repeat(1,4).flatten()
-                lvl0_pos_y[2::4] += 1
-                lvl0_pos_y[3::4] += 1
-                lvl0_pos_x[1::2] += 1
-                assert len(lvl0_pos_x) == len(lvl0_tokens)
-
-                # lvl0 pos_embed
-                full_pos_embed = self.encoder_pos_embeds
-                lvl0_pos_embed = torch.cat([full_pos_embed[ys,xs]\
-                                            for (ys,xs) in zip(lvl0_pos_y.split(lvl0_token_lens), lvl0_pos_x.split(lvl0_token_lens))], dim=0)
-                lvl0_tokens = lvl0_tokens + lvl0_pos_embed
-                _enc_mark('lvl0_patch')
-
-
-                # update tokens
-                x_list = [torch.cat([cr, lvl0],dim=0).unsqueeze(0)\
-                                for (cr, lvl0) \
-                                in zip(cr_token_list, lvl0_tokens.split(lvl0_token_lens))]
-                if profile_encoder_blocks:
-                    self.encoder._sat_profile_segment = 'lvl0_update'
-                x_list = self.encoder.forward_specific_layers_list(x_list, end=self.sat_cfg['get_map_layer'], get_feature=False)
-                lvl0_tokens = _drop_register_tokens_concat(x_list, self.encoder.num_register_tokens)
-                assert len(lvl0_pos_x) == len(lvl0_tokens)
-                _enc_mark('lvl0_update')
-                # also update lvl1 and crs
-                lvl1_tokens = updated_lvl1
-                cr_token_list = updated_cr_list
-
-                
-
-                if self.sat_cfg['num_lvls'] == 2:
-                    # drop corresponding lvl1 tokens
-                    lvl1_keep = ~lvl1_sat_mask
-                    lvl1_token_lens = [msk.sum().item() for msk in lvl1_keep.split(lvl1_token_lens)]
-                    lvl1_keep_idx = lvl1_keep.nonzero(as_tuple=True)[0]
-                    torch._check_is_size(lvl1_keep_idx.size(0))
-                    lvl1_tokens = lvl1_tokens.index_select(0, lvl1_keep_idx)
-                    lvl1_pos_y = lvl1_pos_y.index_select(0, lvl1_keep_idx)
-                    lvl1_pos_x = lvl1_pos_x.index_select(0, lvl1_keep_idx)
-
-                    # normalize positions
-                    lvl0_pos_y_norm = (lvl0_pos_y.to(dtype=lvl0_tokens.dtype) + 0.5) / self.feature_size[0]
-                    lvl0_pos_x_norm = (lvl0_pos_x.to(dtype=lvl0_tokens.dtype) + 0.5) / self.feature_size[0]
-                    lvl1_pos_y_norm = (lvl1_pos_y.to(dtype=lvl1_tokens.dtype) + 0.5) / self.feature_size[1]
-                    lvl1_pos_x_norm = (lvl1_pos_x.to(dtype=lvl1_tokens.dtype) + 0.5) / self.feature_size[1]
-
-                    # merge all
-                    x_list = [torch.cat([cr, lvl0, lvl1]).unsqueeze(0) \
-                                    for cr, lvl0, lvl1 \
-                                    in zip(cr_token_list, lvl0_tokens.split(lvl0_token_lens), lvl1_tokens.split(lvl1_token_lens))]
-                    pos_y_list = [torch.cat([lvl0, lvl1]) \
-                                        for lvl0, lvl1 \
-                                        in zip(lvl0_pos_y_norm.split(lvl0_token_lens), lvl1_pos_y_norm.split(lvl1_token_lens))]
-                    pos_x_list = [torch.cat([lvl0, lvl1]) \
-                                        for lvl0, lvl1 \
-                                        in zip(lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens))]
-                    lvl_list = [torch.cat([torch.zeros_like(lvl0, dtype=int), torch.ones_like(lvl1, dtype=int)]) \
-                                        for lvl0, lvl1 \
-                                        in zip(lvl0_pos_x_norm.split(lvl0_token_lens), lvl1_pos_x_norm.split(lvl1_token_lens))]
-
-
-                else:
-                    # prune lvl1 correspond to lvl0
-                    lvl1_valid_mask = self.pad_mask(lvl1_valid_mask)
-                    lvl1_keep = lvl1_valid_mask & (~lvl1_sat_mask)
-                    lvl1_to_lvl2 = ~lvl1_valid_mask
-
-                    token_lvls = [lvl0_tokens, lvl1_tokens]
-                    token_lens_lvls = [lvl0_token_lens, lvl1_token_lens]
-                    pos_y_lvls = [lvl0_pos_y, lvl1_pos_y]
-                    pos_x_lvls = [lvl0_pos_x, lvl1_pos_x]
-
-                    to_next_lvl = lvl1_to_lvl2
-                    keep = lvl1_keep
-                    lvl_zorders = lvl1_zorders
-                    lvl_bids = lvl1_bids
-                    pad_vals = torch.full((3,), -1, dtype=lvl_zorders.dtype, device=lvl_zorders.device)
-                    for lvl in range(self.sat_cfg['num_lvls']-2):
-                        # if to_next_lvl.sum() == 0:
-                        #     break
-                        next_idx = to_next_lvl.nonzero(as_tuple=True)[0]
-                        keep_idx = keep.nonzero(as_tuple=True)[0]
-                        torch._check_is_size(next_idx.size(0))
-                        torch._check_is_size(keep_idx.size(0))
-                        next_tokens = self.lvl_pooling(token_lvls[-1].index_select(0, next_idx))
-                        # next_tokens = torch.max(token_lvls[-1][to_next_lvl].view(-1,4,C), dim=1)[0]
-                        next_pos_y = pos_y_lvls[-1].index_select(0, next_idx)[::4]>>1
-                        next_pos_x = pos_x_lvls[-1].index_select(0, next_idx)[::4]>>1
-                        next_lens = [msk.sum().item()//4 for msk in to_next_lvl.split(token_lens_lvls[-1])]
-
-
-                        token_lvls[-1] = token_lvls[-1].index_select(0, keep_idx)
-                        pos_y_lvls[-1] = pos_y_lvls[-1].index_select(0, keep_idx)
-                        pos_x_lvls[-1] = pos_x_lvls[-1].index_select(0, keep_idx)
-                        token_lens_lvls[-1] = [msk.sum().item() for msk in keep.split(token_lens_lvls[-1])]
-
-                        token_lvls.append(next_tokens)
-                        token_lens_lvls.append(next_lens)
-                        pos_y_lvls.append(next_pos_y)
-                        pos_x_lvls.append(next_pos_x)
-
-                        if lvl < self.sat_cfg['num_lvls']-3:
-                            lvl_zorders = lvl_zorders.index_select(0, next_idx)[::4]>>2
-                            lvl_bids = lvl_bids.index_select(0, next_idx)[::4]
-
-                            z_starts_idx = torch.where((lvl_zorders&3)==0)[0]
-                            padded_z = torch.cat([lvl_zorders, pad_vals])
-                            padded_bids = torch.cat([lvl_bids, pad_vals])
-                            valids = (padded_z[z_starts_idx] + 3 == padded_z[z_starts_idx + 3]) & (padded_bids[z_starts_idx] == padded_bids[z_starts_idx + 3])
-                            valid_starts = z_starts_idx[valids]
-                        
-                            to_next_lvl = torch.zeros_like(lvl_zorders, dtype=bool)
-                            to_next_lvl[valid_starts] = True
-                            to_next_lvl[valid_starts+1] = True
-                            to_next_lvl[valid_starts+2] = True
-                            to_next_lvl[valid_starts+3] = True
-
-                            keep = ~to_next_lvl
-
-                    norm_pos_y_lvls = _normalize_pos_per_lvl(pos_y_lvls, lvl0_tokens.dtype, self.feature_size)
-                    norm_pos_x_lvls = _normalize_pos_per_lvl(pos_x_lvls, lvl0_tokens.dtype, self.feature_size)
-
-                    x_list = _build_x_list_multi(cr_token_list, token_lvls, token_lens_lvls)
-                    pos_y_list = _build_pos_list_multi(norm_pos_y_lvls, token_lens_lvls)
-                    pos_x_list = _build_pos_list_multi(norm_pos_x_lvls, token_lens_lvls)
-                    lvl_list = _build_lvl_id_list_multi(norm_pos_x_lvls, token_lens_lvls)
-
-                
 
         start = self.sat_cfg['get_map_layer'] if self.use_sat else 0
-        if profile_encoder_blocks:
-            self.encoder._sat_profile_segment = 'final_blocks'
         _, final_feature_list = self.encoder.forward_specific_layers_list(x_list, start = start, norm=True)
-        _enc_mark('final_blocks')
 
         # proj
         token_lens = [feature.shape[1] for feature in final_feature_list]
@@ -708,31 +584,6 @@ class Model(nn.Module):
         sat_dict = {'pos_y': pos_y_list, 'pos_x': pos_x_list, 'lvl': lvl_list, 
                     #  'features': [feature.squeeze(0) for feature in final_feature_list],
                      'lens': token_lens}
-        _enc_mark('project_pos')
-        if profile_encoder:
-            parts = []
-            total_ms = 0.0
-            for (prev_name, prev_t), (name, cur_t) in zip(enc_marks, enc_marks[1:]):
-                elapsed_ms = (cur_t - prev_t) * 1000.0
-                total_ms += elapsed_ms
-                parts.append(f"{prev_name}->{name}={elapsed_ms:.2f}ms")
-            extra = ""
-            if enc_profile_extra:
-                extra = (
-                    f" lvl1_total={enc_profile_extra.get('lvl1_total')} "
-                    f"lvl1_valid={enc_profile_extra.get('lvl1_valid')} "
-                    f"lvl1_sat={enc_profile_extra.get('lvl1_sat')} "
-                    f"lvl0_tokens={enc_profile_extra.get('lvl0_tokens')}"
-                )
-            print(
-                f"[PROFILE_ENCODER] forward={profile_count} total={total_ms:.2f}ms "
-                f"{' '.join(parts)} token_lens=[{','.join(str(int(x)) for x in token_lens)}]{extra}"
-            )
-        if profile_encoder_blocks:
-            self.encoder._sat_profile_blocks = prev_encoder_block_profile
-            self.encoder._sat_profile_forward_index = prev_encoder_block_forward
-            self.encoder._sat_profile_segment = prev_encoder_block_segment
-
         return final_features, pos_embeds, token_lens, scale_map_dict, sat_dict
 
     def process_smpl(self, poses, shapes, cam_xys, cam_intrinsics, detach_j3ds = False):
@@ -787,34 +638,6 @@ class Model(nn.Module):
 
         assert isinstance(samples, (list, torch.Tensor))
 
-        profile_count = int(getattr(self, '_sat_profile_forward_count', 0))
-        profile_limit = int(getattr(self, '_sat_profile_forward_limit', 0))
-        profile_forward = (
-            bool(getattr(self, '_sat_profile_forward', False))
-            and not self.training
-            and (profile_limit <= 0 or profile_count < profile_limit)
-        )
-        profile_marks = []
-        profile_device = None
-        if profile_forward:
-            if isinstance(samples, list) and samples:
-                profile_device = samples[0].device
-            elif isinstance(samples, torch.Tensor):
-                profile_device = samples.device
-
-            def _profile_sync():
-                if profile_device is not None and profile_device.type == 'cuda':
-                    torch.cuda.synchronize(profile_device)
-
-            def _profile_mark(name):
-                _profile_sync()
-                #profile_marks.append((name, time.perf_counter()))
-
-            _profile_mark('start')
-        else:
-            def _profile_mark(name):
-                return None
-
         if self.training:
             self.preprocessed_pos_lvl1 = None
 
@@ -831,11 +654,9 @@ class Model(nn.Module):
         cam_intrinsics = self.cam_intrinsics.repeat(bs, 1, 1, 1)
         cam_intrinsics[...,:2,2] = cam_intrinsics[...,:2,2] * valid_ratio[:, None, :]
 
-        _profile_mark('setup')
 
         final_features, pos_embeds, token_lens, scale_map_dict, sat_dict\
              = self.forward_encoder(samples, targets, use_gt = sat_use_gt)
-        _profile_mark('encoder')
 
         # default dab-detr pipeline
         embedweight = (self.refpoint_embed.weight).unsqueeze(0).repeat(bs,1,1)
@@ -851,20 +672,17 @@ class Model(nn.Module):
             attn_mask = None
 
         tgt_lens = [tgt.shape[1]]*bs
-        _profile_mark('query_setup')
 
         hs, reference = self.decoder(memory=final_features, memory_lens=token_lens,
                                          tgt=tgt.flatten(0,1), tgt_lens=tgt_lens,
                                          refpoint_embed=embedweight.flatten(0,1),
                                          pos_embed=pos_embeds,
                                          self_attn_mask = attn_mask)
-        _profile_mark('decoder')
         
         reference_before_sigmoid = inverse_sigmoid(reference)
         bbox_tmp = self.forward_bbox_embed(hs)
         bbox_tmp[..., :self.query_dim] += reference_before_sigmoid
         pred_boxes = bbox_tmp.sigmoid()
-        _profile_mark('bbox')
 
         outputs_poses = []
         outputs_shapes = []
@@ -903,7 +721,6 @@ class Model(nn.Module):
                 outputs_j3ds.append(outputs_j3d)
                 outputs_j2ds.append(outputs_j2d)
                 outputs_depths.append(depth)
-        _profile_mark('heads_smpl')
         
         pred_poses = torch.stack(outputs_poses)
         pred_betas = torch.stack(outputs_shapes)
@@ -947,21 +764,6 @@ class Model(nn.Module):
 
         if self.training > 0 and self.use_dn:
             out['dn_meta'] = dn_meta
-
-        if profile_forward:
-            _profile_mark('end')
-            parts = []
-            total_ms = 0.0
-            for (prev_name, prev_t), (name, cur_t) in zip(profile_marks, profile_marks[1:]):
-                elapsed_ms = (cur_t - prev_t) * 1000.0
-                total_ms += elapsed_ms
-                parts.append(f"{prev_name}->{name}={elapsed_ms:.2f}ms")
-            token_lens_str = ",".join(str(int(x)) for x in token_lens)
-            print(
-                f"[PROFILE] forward={profile_count} total={total_ms:.2f}ms "
-                f"{' '.join(parts)} token_lens=[{token_lens_str}] hs={tuple(hs.shape)}"
-            )
-            self._sat_profile_forward_count = profile_count + 1
 
         return out
 

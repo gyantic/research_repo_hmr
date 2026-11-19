@@ -14,7 +14,6 @@ import warnings
 from torch import Tensor
 from torch import nn
 
-from models.int8_attention import int8_attention_enabled, torchao_int8_attention
 
 logger = logging.getLogger("dinov2")
 
@@ -54,20 +53,17 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: Tensor, attn_bias=None) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         q, k, v = qkv[0] * self.scale, qkv[1], qkv[2]
-        if int8_attention_enabled() and not self.training:
-            x = torchao_int8_attention(q, k, v, attn_bias=attn_bias, out_dtype=x.dtype).transpose(1, 2).reshape(B, N, C)
-        else:
-            attn = q @ k.transpose(-2, -1)
-            if attn_bias is not None:
-                attn = attn + attn_bias.to(device=attn.device, dtype=attn.dtype)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        attn = q @ k.transpose(-2, -1)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -75,17 +71,6 @@ class Attention(nn.Module):
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
-        if int8_attention_enabled():
-            dense_bias = attn_bias
-            if attn_bias is not None and hasattr(attn_bias, "materialize"):
-                B, N, _ = x.shape
-                dense_bias = attn_bias.materialize(
-                    (B, self.num_heads, N, N),
-                    dtype=x.dtype,
-                    device=x.device,
-                )
-            return super().forward(x, attn_bias=dense_bias)
-
         if not XFORMERS_AVAILABLE:
             if attn_bias is not None:
                 raise AssertionError("xFormers is required for using nested tensors")

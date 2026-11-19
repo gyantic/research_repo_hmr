@@ -10,19 +10,7 @@ from utils.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 import time
 import cv2
 import trimesh
-
-
-def move_samples_to_model(samples, model, device):
-    sample_dtype = getattr(model, 'input_dtype', torch.float32)
-    model_float_dtypes = {torch.float16, torch.float32, torch.float64, torch.bfloat16}
-    moved = []
-    for sample in samples:
-        if sample.is_floating_point() and sample_dtype in model_float_dtypes:
-            moved.append(sample.to(device=device, dtype=sample_dtype, non_blocking=True))
-        else:
-            moved.append(sample.to(device=device, non_blocking=True))
-    return moved
-
+from .eval_funcs import move_samples_to_model
 
 def inference(model, infer_dataloader, conf_thresh, results_save_path = None,
                         distributed = False, accelerator = None):

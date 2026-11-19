@@ -8,7 +8,7 @@ import cv2, os
 #-----------------------------------------------------------------------------------------#
 
 class preds_save_paths(object):
-    def __init__(self, results_save_dir="./results", prefix='test'):
+    def __init__(self, results_save_dir, prefix='test'):
         self.seq_save_dir = os.path.join(results_save_dir, prefix)
         os.makedirs(self.seq_save_dir, exist_ok=True)
 

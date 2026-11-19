@@ -6,7 +6,6 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,5 +102,3 @@ def save_figure(fig, out_dir, name):
     plt.close(fig)
     print(" ", path)
 
-
-__all__ = ["np", "pd", "plt"]

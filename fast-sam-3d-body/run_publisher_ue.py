@@ -1,6 +1,6 @@
-"""Real-time SMPL publisher with Unreal Engine UDP/TCP streaming.
+"""Real-time SMPL publisher with Unreal Engine UDP streaming.
 
-run_publisher.py をベースに、ZMQ 配信に加えて UE への UDP/TCP 送信を行う。
+run_publisher.py をベースに、ZMQ 配信に加えて UE への UDP 送信を行う。
 
 使い方 (UDP):
     python run_publisher_ue.py \\
@@ -10,15 +10,6 @@ run_publisher.py をベースに、ZMQ 配信に加えて UE への UDP/TCP 送�
         --mhr2smpl-mapping-path <mapping.npz> \\
         --ue udp \\
         --ue-port 62004 \\
-        --local-port 5555
-
-使い方 (TCP):
-    python run_publisher_ue.py \\
-        --source camera \\
-        --smpl-model-path <smpl.pkl> \\
-        --nn-model-dir <model_dir> \\
-        --mhr2smpl-mapping-path <mapping.npz> \\
-        --ue tcp \\
         --local-port 5555
 
 使い方 (動画ファイル入力):
@@ -33,7 +24,6 @@ run_publisher.py をベースに、ZMQ 配信に加えて UE への UDP/TCP 送�
 
 import argparse
 import csv
-import datetime
 import os
 import sys
 import threading
@@ -43,7 +33,7 @@ from collections import deque
 os.environ.setdefault("TORCHINDUCTOR_CUDAGRAPH_TREES", "0")
 os.environ.setdefault("SAM3D_QUIET", "1")
 
-# Performance settings (from run_demo.sh)
+# Performance settings (defaults = the paper's INT8 TensorRT configuration)
 os.environ.setdefault("USE_TRT_BACKBONE", "1")
 os.environ.setdefault("TRT_BACKBONE_PATH", "./checkpoints/sam-3d-body-dinov3/backbone_trt/backbone_dinov3_int8.engine")
 os.environ.setdefault("GPU_HAND_PREP", "1")
@@ -112,7 +102,7 @@ YOLO_MODEL_PATH = "checkpoints/yolo/yolo11m-pose.engine"
 class RealtimePublisherUE:
     """run_publisher.py の RealtimePublisher に UE 送信機能を追加したクラス。
 
-    ZMQ ストリーム (既存) と UE UDP/TCP 送信 (追加) を並行して行う。
+    ZMQ ストリーム (既存) と UE UDP 送信 (追加) を並行して行う。
     """
 
     def __init__(
@@ -130,13 +120,10 @@ class RealtimePublisherUE:
         yolo_model_path=YOLO_MODEL_PATH,
         record=False,
         record_dir="output/records",
-        min_person_confidence=0.75,
         ue_sender=None,
         metrics_csv=None,
-        summary_csv=None,
     ):
         logger.info("Initializing Realtime Publisher (UE)...")
-        self.min_person_confidence = min_person_confidence
 
         logger.info("Loading SAM 3D model...")
         self.estimator = build_default_estimator(
@@ -226,7 +213,6 @@ class RealtimePublisherUE:
         # UE sender (None の場合は UE 送信を行わない)
         self.ue_sender = ue_sender
         self.metrics_csv = metrics_csv
-        self.summary_csv = summary_csv
 
         # UE 送信 FPS 計測
         self._ue_send_times = deque(maxlen=60)
@@ -723,31 +709,7 @@ class RealtimePublisherUE:
         self._final_stats_logged = True
 
     def _save_stats_csv(self):
-        def finite_array(values):
-            arr = np.asarray(values, dtype=np.float64)
-            return arr[np.isfinite(arr)]
-
-        def mean_or_nan(values):
-            arr = finite_array(values)
-            return float(np.mean(arr)) if arr.size else float("nan")
-
-        def median_or_nan(values):
-            arr = finite_array(values)
-            return float(np.median(arr)) if arr.size else float("nan")
-
-        def variance_or_nan(values):
-            arr = finite_array(values)
-            return float(np.var(arr)) if arr.size else float("nan")
-
-        def fps_values(ms_values):
-            arr = finite_array(ms_values)
-            arr = arr[arr > 0]
-            return 1000.0 / arr if arr.size else arr
-
-        def prepare_csv_path(path):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            return path
-
+        """Write the per-inference-frame timing CSV (--metrics-csv)."""
         frame_header = [
             "infer_index",
             "source_timestamp",
@@ -764,124 +726,14 @@ class RealtimePublisherUE:
             "status",
         ]
         frame_stats = list(self.stats.get("frame_stats", []))
-        frame_csv = prepare_csv_path(
-            self.metrics_csv or "output/benchmark_frame_stats.csv"
-        )
+        frame_csv = self.metrics_csv or "output/benchmark_frame_stats.csv"
+        os.makedirs(os.path.dirname(frame_csv) or ".", exist_ok=True)
         with open(frame_csv, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=frame_header)
             writer.writeheader()
             for row in frame_stats:
                 writer.writerow({key: row.get(key, "") for key in frame_header})
         logger.info(f"Frame stats saved to {frame_csv}")
-
-        sent_rows = [row for row in frame_stats if row.get("ue_sent") == 1]
-        infer_ms_values = [row.get("infer_ms", np.nan) for row in frame_stats]
-        total_ms_values = [row.get("total_ms", np.nan) for row in sent_rows]
-        backbone_ms_values = [row.get("backbone_ms", np.nan) for row in frame_stats]
-        decoders_ms_values = [row.get("decoders_ms", np.nan) for row in frame_stats]
-        detection_ms_values = [row.get("detection_ms", np.nan) for row in frame_stats]
-        fov_ms_values = [row.get("fov_ms", np.nan) for row in frame_stats]
-        convert_ms_values = [row.get("convert_ms", np.nan) for row in sent_rows]
-        send_ms_values = [row.get("send_ms", np.nan) for row in sent_rows]
-
-        path = prepare_csv_path(self.summary_csv or "output/benchmark_stats.csv")
-        backbone_path = os.environ.get("TRT_BACKBONE_PATH", "")
-        fov_path = os.environ.get("FOV_TRT_PATH", "")
-        pub_hz = 1.0 / np.mean(self.stats["publish_intervals"]) if self.stats["publish_intervals"] else float("nan")
-        ue_fps = (
-            self.stats.get("ue_send_count", 0)
-            / max(sum(self.stats["inference_times"]), 1e-9)
-            if self.stats["inference_times"]
-            else float("nan")
-        )
-        summary_header = [
-            "timestamp",
-            "backbone_engine",
-            "fov_engine",
-            "infer_ms_mean",
-            "infer_ms_median",
-            "infer_ms_variance",
-            "infer_fps_mean",
-            "infer_fps_median",
-            "infer_fps_variance",
-            "total_ms_mean",
-            "total_ms_median",
-            "total_ms_variance",
-            "total_fps_mean",
-            "total_fps_median",
-            "total_fps_variance",
-            "backbone_ms_mean",
-            "backbone_ms_median",
-            "decoders_ms_mean",
-            "decoders_ms_median",
-            "detection_ms_mean",
-            "detection_ms_median",
-            "fov_ms_mean",
-            "fov_ms_median",
-            "convert_ms_mean",
-            "convert_ms_median",
-            "send_ms_mean",
-            "send_ms_median",
-            "publish_hz",
-            "ue_send_fps",
-            "published",
-            "fallback",
-            "capture_drop",
-            "infer_count",
-            "ue_send_count",
-            "no_send_count",
-            "frame_stats_csv",
-        ]
-        if os.path.exists(path):
-            with open(path, newline="") as f:
-                first_row = next(csv.reader(f), [])
-            if first_row and first_row != summary_header:
-                stem, ext = os.path.splitext(path)
-                path = f"{stem}_with_median{ext or '.csv'}"
-        write_header = not os.path.exists(path) or os.path.getsize(path) == 0
-        with open(path, "a", newline="") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(summary_header)
-            writer.writerow([
-                datetime.datetime.now().isoformat(),
-                os.path.basename(backbone_path),
-                os.path.basename(fov_path),
-                f"{mean_or_nan(infer_ms_values):.2f}",
-                f"{median_or_nan(infer_ms_values):.2f}",
-                f"{variance_or_nan(infer_ms_values):.2f}",
-                f"{mean_or_nan(fps_values(infer_ms_values)):.2f}",
-                f"{median_or_nan(fps_values(infer_ms_values)):.2f}",
-                f"{variance_or_nan(fps_values(infer_ms_values)):.2f}",
-                f"{mean_or_nan(total_ms_values):.2f}",
-                f"{median_or_nan(total_ms_values):.2f}",
-                f"{variance_or_nan(total_ms_values):.2f}",
-                f"{mean_or_nan(fps_values(total_ms_values)):.2f}",
-                f"{median_or_nan(fps_values(total_ms_values)):.2f}",
-                f"{variance_or_nan(fps_values(total_ms_values)):.2f}",
-                f"{mean_or_nan(backbone_ms_values):.2f}",
-                f"{median_or_nan(backbone_ms_values):.2f}",
-                f"{mean_or_nan(decoders_ms_values):.2f}",
-                f"{median_or_nan(decoders_ms_values):.2f}",
-                f"{mean_or_nan(detection_ms_values):.2f}",
-                f"{median_or_nan(detection_ms_values):.2f}",
-                f"{mean_or_nan(fov_ms_values):.2f}",
-                f"{median_or_nan(fov_ms_values):.2f}",
-                f"{mean_or_nan(convert_ms_values):.2f}",
-                f"{median_or_nan(convert_ms_values):.2f}",
-                f"{mean_or_nan(send_ms_values):.2f}",
-                f"{median_or_nan(send_ms_values):.2f}",
-                f"{pub_hz:.2f}",
-                f"{ue_fps:.2f}",
-                self.stats["publish_count"],
-                self.stats["publish_fallback_count"],
-                self.stats["dropped_capture_count"],
-                self.stats["infer_count"],
-                self.stats["ue_send_count"],
-                self.stats["infer_count"] - self.stats["ue_send_count"],
-                frame_csv,
-            ])
-        logger.info(f"Stats saved to {path}")
 
     def _release_video_source_with_timeout(self, timeout_s=10.0):
         release_errors = []
@@ -974,7 +826,7 @@ class RealtimePublisherUE:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Publish SAM 3D pose over ZMQ + Unreal Engine UDP/TCP"
+        description="Publish SAM 3D pose over ZMQ + Unreal Engine UDP"
     )
     parser.add_argument(
         "--source",
@@ -1068,22 +920,10 @@ def main():
         help="Directory to save recordings",
     )
     parser.add_argument(
-        "--min-person-confidence",
-        type=float,
-        default=0.75,
-        help="Minimum YOLO detection confidence",
-    )
-    parser.add_argument(
         "--metrics-csv",
         type=str,
         default=None,
         help="Per-inference-frame timing CSV path",
-    )
-    parser.add_argument(
-        "--summary-csv",
-        type=str,
-        default=None,
-        help="Summary timing CSV path with mean/median/variance",
     )
 
     # --- UE 通信オプション ---
@@ -1091,25 +931,21 @@ def main():
     ue_group.add_argument(
         "--ue",
         type=str,
-        choices=["udp", "tcp"],
+        choices=["udp"],
         default=None,
-        help=(
-            "Enable UE streaming. "
-            "'udp': wait for HELLO then send datagrams (SAT-HMR compatible). "
-            "'tcp': listen and accept UE connection."
-        ),
+        help="Enable UE streaming: wait for HELLO then send datagrams (SAT-HMR compatible).",
     )
     ue_group.add_argument(
         "--ue-port",
         type=int,
         default=62004,
-        help="[UDP only] UE receive port (default: 62004)",
+        help="UE receive port (default: 62004)",
     )
     ue_group.add_argument(
         "--local-port",
         type=int,
         default=5555,
-        help="Local port: UDP=HELLO listen port, TCP=listen port (default: 5555)",
+        help="Local port to listen for the UE HELLO packet (default: 5555)",
     )
 
     args = parser.parse_args()
@@ -1123,14 +959,10 @@ def main():
     ue_sender = None
     if args.ue is not None:
         ue_sender = UESender(
-            protocol=args.ue,
             ue_port=args.ue_port,
             local_port=args.local_port,
         )
-        logger.info(
-            f"UE sender ({args.ue.upper()}) created. "
-            "Blocking until UE connects (UDP: HELLO packet, TCP: accept)..."
-        )
+        logger.info("UE sender (UDP) created. Blocking until UE sends a HELLO packet...")
         ue_sender.wait_for_connection()
 
     # --- Video source ---
@@ -1165,10 +997,8 @@ def main():
         yolo_model_path=args.yolo_model,
         record=args.record,
         record_dir=args.record_dir,
-        min_person_confidence=args.min_person_confidence,
         ue_sender=ue_sender,
         metrics_csv=args.metrics_csv,
-        summary_csv=args.summary_csv,
     )
 
     try:

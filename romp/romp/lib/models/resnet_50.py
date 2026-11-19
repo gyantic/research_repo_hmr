@@ -24,23 +24,14 @@ class ResNet_50(nn.Module):
         self.backbone_channels = 64
         #self.init_weights()
         #self.load_pretrain_params()
-        if args().model_precision == "fp16":
-            self.half()
-        elif args().model_precision == "bf16":
-            self.to(torch.bfloat16)
 
     def load_pretrain_params(self):
         if os.path.exists(args().resnet_pretrain):
             success_layer = copy_state_dict(self.state_dict(), torch.load(args().resnet_pretrain, weights_only=False), prefix = '', fix_loaded=True)
 
     def image_preprocess(self, x):
+        # The input already has the weight dtype (cast in Base.feed_forward).
         x = BHWC_to_BCHW(x)
-        if args().model_precision == 'fp16':
-            x = x.to(torch.float16)
-        elif args().model_precision == 'bf16':
-            x = x.to(torch.bfloat16)
-        else:
-            x = x.to(torch.float32)
         x = ((x / 255.) * 2.0 - 1.0).contiguous()
         return x
 

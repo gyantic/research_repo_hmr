@@ -12,7 +12,6 @@
 from functools import partial
 import math
 import logging
-import time
 from typing import Sequence, Tuple, Union, Callable
 
 import torch
@@ -398,24 +397,8 @@ class DinoVisionTransformer(nn.Module):
         assert not self.chunked_blocks
         if end is None:
             end = len(self.blocks)
-        profile_blocks = bool(getattr(self, "_sat_profile_blocks", False))
-        profile_forward = int(getattr(self, "_sat_profile_forward_index", 0))
-        profile_segment = getattr(self, "_sat_profile_segment", "specific")
-        profile_device = x_list[0].device if x_list else None
-        for block_idx, blk in enumerate(self.blocks[start:end], start=start):
-            if profile_blocks and profile_device is not None and profile_device.type == "cuda":
-                torch.cuda.synchronize(profile_device)
-            profile_t0 = time.perf_counter() if profile_blocks else None
+        for blk in self.blocks[start:end]:
             x_list = blk(x_list)
-            if profile_blocks:
-                if profile_device is not None and profile_device.type == "cuda":
-                    torch.cuda.synchronize(profile_device)
-                elapsed_ms = (time.perf_counter() - profile_t0) * 1000.0
-                shapes = ",".join(str(tuple(x.shape)) for x in x_list)
-                print(
-                    f"[PROFILE_BLOCK] forward={profile_forward} segment={profile_segment} "
-                    f"block={block_idx} time={elapsed_ms:.2f}ms shapes=[{shapes}]"
-                )
         
         if get_feature:
             out_list = _post_block_outputs(x_list, self.num_register_tokens, self.norm if norm else None)
@@ -427,24 +410,8 @@ class DinoVisionTransformer(nn.Module):
         assert not self.chunked_blocks
         if end is None:
             end = len(self.additional_blocks)
-        profile_blocks = bool(getattr(self, "_sat_profile_blocks", False))
-        profile_forward = int(getattr(self, "_sat_profile_forward_index", 0))
-        profile_segment = getattr(self, "_sat_profile_segment", "additional")
-        profile_device = x_list[0].device if x_list else None
-        for block_idx, blk in enumerate(self.additional_blocks[start:end], start=start):
-            if profile_blocks and profile_device is not None and profile_device.type == "cuda":
-                torch.cuda.synchronize(profile_device)
-            profile_t0 = time.perf_counter() if profile_blocks else None
+        for blk in self.additional_blocks[start:end]:
             x_list = blk(x_list)
-            if profile_blocks:
-                if profile_device is not None and profile_device.type == "cuda":
-                    torch.cuda.synchronize(profile_device)
-                elapsed_ms = (time.perf_counter() - profile_t0) * 1000.0
-                shapes = ",".join(str(tuple(x.shape)) for x in x_list)
-                print(
-                    f"[PROFILE_BLOCK] forward={profile_forward} segment={profile_segment} "
-                    f"block=additional.{block_idx} time={elapsed_ms:.2f}ms shapes=[{shapes}]"
-                )
         
         if get_feature:
             out_list = _post_block_outputs(x_list, self.num_register_tokens, self.norm if norm else None)

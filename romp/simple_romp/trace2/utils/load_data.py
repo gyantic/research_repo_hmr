@@ -64,7 +64,7 @@ class InternetVideo(Dataset):
             self.sid_video_name[sid] = video_name
             self.sequence_ids.append([])
             for fid, frame_path in enumerate(self.sequence_dict[video_path]):
-                self.file_paths.append([sid, fid, frame_path])
+                self.file_paths.append([sid,fid,os.path.join(video_path, frame_path)])
                 self.sequence_ids[sid].append(len(self.file_paths)-1)
         print('sid_video_name:',self.sid_video_name)
 
@@ -78,7 +78,6 @@ class InternetVideo(Dataset):
         sid, frame_id, imgpath = self.get_image_info(index)
         end_frame_flag = frame_id == (len(self.sequence_ids[sid])-1)
         image = cv2.imread(imgpath)
-        print(f"Loading image path: {imgpath}")
         if image is None:
             print('image load None', imgpath)
 

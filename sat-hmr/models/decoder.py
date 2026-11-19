@@ -13,7 +13,6 @@ from torch.nn.functional import scaled_dot_product_attention
 from torch import nn, Tensor
 from torch.nn.init import constant_
 
-from models.int8_attention import int8_attention_enabled, torchao_int8_attention
 from .position_encoding import position_encoding_xy
 
 XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
@@ -386,7 +385,7 @@ class XformerDecoderLayer(nn.Module):
         else:
             bias = None
             
-        if XFORMERS_AVAILABLE and not int8_attention_enabled():
+        if XFORMERS_AVAILABLE:
             tgt2 = memory_efficient_attention(q, k, v, attn_bias=bias)
         else:
             tgt2 = torch_attention(q, k, v, attn_bias=bias)
@@ -429,7 +428,7 @@ class XformerDecoderLayer(nn.Module):
         v = v.view(1, L_mem, self.nhead, self.d_model//self.nhead)
 
         single_batch = len(tgt_lens) == 1 and len(memory_lens) == 1
-        if XFORMERS_AVAILABLE and not int8_attention_enabled():
+        if XFORMERS_AVAILABLE:
             # #6a: single_batch なら BlockDiagonalMask 不要 → get_decoder_block_diag_bias の
             # @_dynamo.disable 境界をスキップして GB 解消狙い。
             if single_batch:
@@ -491,15 +490,6 @@ def build_decoder(args):
 def torch_attention(query, key, value, attn_bias=None):
     scale = 1.0 / query.shape[-1] ** 0.5
     query = query * scale
-    if int8_attention_enabled():
-        return torchao_int8_attention(
-            query,
-            key,
-            value,
-            attn_bias=attn_bias,
-            out_dtype=query.dtype,
-        )
-
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)

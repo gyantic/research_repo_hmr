@@ -17,7 +17,9 @@ mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 cd "$REPO_ROOT/sat-hmr"
 
-INT8=(--weights ./weights/sat_hmr/sat_644_int8w.pth --dtype_cfg bfloat16 --ptq_mode int8_dynamic --no_int8_attn)
+# 出力CSV名の「no_int8_attn」は当時の計測条件名（INT8 attention 実装は削除済み）。
+# make_paper_results.py がこの名前で参照するため変更しない。
+INT8=(--weights ./weights/sat_hmr/sat_644_int8w.pth --dtype_cfg bfloat16 --ptq_mode int8_dynamic)
 COMPILE_ALL=(--compile --compile_encoder_only --compile_decoder_only --compile_heads --compile_dynamic)
 
 run_demo() {  # <出力CSV名> <video_demo.py の引数...>

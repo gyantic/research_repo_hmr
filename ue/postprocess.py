@@ -6,25 +6,16 @@ from fractions import Fraction
 from pathlib import Path
 import subprocess
 
+# Chroma-key defaults used by run_pipeline.py and by this script's CLI.
+KEY_SIMILARITY=.12
+KEY_BLEND=.04
+
 
 def run(args, **kwargs):
     return subprocess.run([str(x) for x in args], check=True, **kwargs)
 
 
-def canonical_sidecar(path):
-    """Return the calibrated canonical.mkv sidecar when it is newer than the video, else None."""
-    sidecar=Path(str(path)+'.json')
-    if Path(path).name!='canonical.mkv' or not sidecar.is_file():return None
-    info=json.loads(sidecar.read_text(encoding='utf-8'))
-    if 'canonical_K' not in info or sidecar.stat().st_mtime_ns<Path(path).stat().st_mtime_ns:return None
-    return info
-
-
 def probe(path, ffprobe='ffprobe'):
-    info=canonical_sidecar(path)
-    if info is not None:
-        rate=Fraction(info['fps']).limit_denominator(1001000)
-        return {'path':str(path),'duration':info['frames']/float(rate),'fps':str(rate),'frames':info['frames'],'width':info['width'],'height':info['height'],'has_audio':False}
     data=json.loads(run([ffprobe,'-v','error','-count_frames','-show_streams','-show_format','-of','json',path],capture_output=True,text=True).stdout)
     video=next(s for s in data['streams'] if s['codec_type']=='video')
     fps=Fraction(video['avg_frame_rate'])
@@ -42,8 +33,6 @@ def probe(path, ffprobe='ffprobe'):
 
 
 def ensure_cfr(path, fps, ffprobe):
-    info=canonical_sidecar(path)
-    if info is not None and abs(info['fps']-float(Fraction(fps)))<1e-5:return
     data=json.loads(run([ffprobe,'-v','error','-select_streams','v:0','-show_frames',
                          '-show_entries','frame=best_effort_timestamp_time','-of','json',path],capture_output=True,text=True).stdout)
     stamps_s=[float(f['best_effort_timestamp_time']) for f in data['frames'] if 'best_effort_timestamp_time' in f]
@@ -118,8 +107,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source',required=True);p.add_argument('--recording',required=True)
     p.add_argument('--output-dir',required=True);p.add_argument('--repeat',type=int,default=6)
-    p.add_argument('--key-color');p.add_argument('--similarity',type=float,default=.12)
-    p.add_argument('--blend',type=float,default=.04);p.add_argument('--despill',action='store_true')
+    p.add_argument('--key-color');p.add_argument('--similarity',type=float,default=KEY_SIMILARITY)
+    p.add_argument('--blend',type=float,default=KEY_BLEND);p.add_argument('--despill',action='store_true')
     p.add_argument('--ffmpeg',default='ffmpeg');p.add_argument('--ffprobe',default='ffprobe')
     args=p.parse_args()
     if not 0.01<=args.similarity<=1 or not 0<=args.blend<=1 or args.repeat<1: p.error('Invalid key/repeat settings')

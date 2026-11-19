@@ -8,7 +8,8 @@ step0_infer_3dpw.py が書いた sample_*.npz（MHR メッシュの推定）を�
   h36m14_global_orient  SMPL 頂点から H36M 回帰行列で求めた 14 関節（本論文の評価、図2）
   paper_3dpw14          SMPL 関節列の先頭 14 関節と 3DPW の gt_joints_3d[:14]（原論文の関節集合、脚注1）
 
-    python measurements/fastsam/evaluate_3dpw.py --samples_dir <step0 の出力>/samples         --output_json metrics.json --output_csv metrics.csv --pa_protocol h36m14_global_orient
+    python measurements/fastsam/evaluate_3dpw.py --samples_dir <step0 の出力>/samples \\
+        --output_json metrics.json --output_csv metrics.csv --pa_protocol h36m14_global_orient
 """
 
 from __future__ import annotations
@@ -186,7 +187,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples_dir", required=True)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--output_csv", required=True)
-    parser.add_argument("--vertices_npz", default="", help="Optional fitted SMPL vertices npz with pred_smpl_vertices")
     parser.add_argument("--data_dir", default=str(Path(__file__).resolve().parents[2] / "datasets" / "3dpw"))
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--smpl_model", default=str(SMPL_DIR / "SMPL_NEUTRAL.pkl"))
@@ -232,11 +232,7 @@ def load_pred_vertices(
     sample_files: list[Path],
     device: torch.device,
 ) -> np.ndarray:
-    """[N, 6890, 3] predicted SMPL vertices: from --vertices_npz if given, else barycentric MHR->SMPL."""
-    if args.vertices_npz:
-        pred_v = np.load(args.vertices_npz)["pred_smpl_vertices"].astype(np.float32)
-        return pred_v[: len(sample_files)]
-
+    """[N, 6890, 3] predicted SMPL vertices via the barycentric MHR->SMPL mapping."""
     mhr_faces, triangle_ids, barycentric = load_barycentric_mapping(args.mapping, args.mhr_face_mesh, device)
     pred_vertices = []
     for start in tqdm(range(0, len(sample_files), args.batch_size), desc="Barycentric pred"):
@@ -324,7 +320,6 @@ def main() -> None:
     summary = {name: summarize(values) for name, values in metrics.items()}
     summary["num_samples"] = len(sample_files)
     summary["samples_dir"] = str(samples_dir)
-    summary["vertices_npz"] = args.vertices_npz
     summary["pa_protocol"] = args.pa_protocol
     h36m = args.pa_protocol == "h36m14_global_orient"
     summary["metric_protocol"] = {

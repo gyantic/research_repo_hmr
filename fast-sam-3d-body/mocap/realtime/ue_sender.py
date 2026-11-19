@@ -6,70 +6,48 @@ from scipy.spatial.transform import Rotation
 
 
 class UESender:
-    """UDP/TCP 両対応で Unreal Engine に SMPL データを送信するクラス。
+    """UDP で Unreal Engine に SMPL データを送信するクラス。
 
     SAT-HMR (github.com/yangtiming/SAT-HMR) の UE 通信プロトコルと互換。
 
     ペイロード形式:
-        "{96 quaternion values}|{3 translation values}<terminator>"
-        - UDP: 改行 \\n で終端
-        - TCP: NULL \\x00 で終端
+        "{96 quaternion values}|{3 translation values}\\n"
         - quaternion: 24 joints × 4 (x,y,z,w)
         - translation: (x,y,z) cm
 
     使い方::
-        sender = UESender(protocol="udp")
-        sender.wait_for_connection()   # ブロック: UE 接続/HELLO 待機
+        sender = UESender()
+        sender.wait_for_connection()   # ブロック: UE の HELLO 待機
         sender.send(global_rot, smpl_pose, pred_cam_t)
         sender.close()
     """
 
     def __init__(
         self,
-        protocol: str = "udp",
-        ue_host: str = "0.0.0.0",
         ue_port: int = 62004,
         local_port: int = 5555,
     ):
         """
         Args:
-            protocol: "udp" or "tcp"
-            ue_host:  UDP 送信先 IP（UDP では HELLO 受信時に自動検出するため通常不要）。
-                      TCP ではバインドアドレス（"0.0.0.0" で全 IF 受け付け）。
-            ue_port:  UDP 送信先ポート（UE 受信ポート）。TCP では未使用。
-            local_port: UDP 待受ポート (HELLO 受信) / TCP リッスンポート。
+            ue_port:  送信先ポート（UE 受信ポート）。送信先 IP は HELLO の送信元から決まる。
+            local_port: HELLO を待ち受けるポート。
         """
-        if protocol not in ("udp", "tcp"):
-            raise ValueError(f"protocol must be 'udp' or 'tcp', got {protocol!r}")
-
-        self.protocol = protocol
-        self.ue_host = ue_host
         self.ue_port = ue_port
         self.local_port = local_port
 
         self.is_connected = False
         self._sock = None
-        self._conn = None       # TCP のみ: accept() で得た接続ソケット
-        self._udp_target = None  # UDP のみ: (host, port) 送信先
+        self._udp_target = None  # (host, port) 送信先
 
     # ------------------------------------------------------------------
     # 接続確立
     # ------------------------------------------------------------------
 
     def wait_for_connection(self) -> None:
-        """UE との接続が確立するまでブロックする。
+        """ローカルポートで UE の HELLO パケットを受信するまでブロックする。
 
-        UDP: ローカルポートで HELLO パケットを受信するまで待機。
-             送信元アドレスを UE ホストとして保存。
-        TCP: ローカルポートで listen し、UE の接続を待つ。
+        送信元アドレスを UE ホストとして保存する。
         """
-        if self.protocol == "udp":
-            self._wait_udp()
-        else:
-            self._wait_tcp()
-        self.is_connected = True
-
-    def _wait_udp(self) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("0.0.0.0", self.local_port))
@@ -77,16 +55,7 @@ class UESender:
         _, addr = self._sock.recvfrom(2048)
         self._udp_target = (addr[0], self.ue_port)
         logger.info(f"[UE/UDP] HELLO received from {addr} -> will send to {self._udp_target}")
-
-    def _wait_tcp(self) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((self.ue_host, self.local_port))
-        self._sock.listen(1)
-        logger.info(f"[UE/TCP] Listening on {self.ue_host}:{self.local_port} ...")
-        self._conn, addr = self._sock.accept()
-        self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        logger.info(f"[UE/TCP] UE connected from {addr}")
+        self.is_connected = True
 
     # ------------------------------------------------------------------
     # 送信
@@ -120,14 +89,10 @@ class UESender:
             return
 
         try:
-            if self.protocol == "udp":
-                payload = f"{pose_str}|{trans_str}\n".encode("ascii")
-                self._sock.sendto(payload, self._udp_target)
-            else:
-                msg = f"{pose_str}|{trans_str}\x00"
-                self._conn.sendall(msg.encode("ascii"))
+            payload = f"{pose_str}|{trans_str}\n".encode("ascii")
+            self._sock.sendto(payload, self._udp_target)
         except Exception as exc:
-            logger.warning(f"[UE/{self.protocol.upper()}] send failed: {exc}")
+            logger.warning(f"[UE/UDP] send failed: {exc}")
 
     # ------------------------------------------------------------------
     # ペイロード構築 (座標変換)
@@ -188,16 +153,10 @@ class UESender:
 
     def close(self) -> None:
         self.is_connected = False
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
         if self._sock is not None:
             try:
                 self._sock.close()
             except Exception:
                 pass
             self._sock = None
-        logger.info(f"[UE/{self.protocol.upper()}] Closed.")
+        logger.info("[UE/UDP] Closed.")

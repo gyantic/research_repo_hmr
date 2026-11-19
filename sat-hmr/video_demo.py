@@ -19,15 +19,11 @@ import sys
 import time
 from types import MethodType
 
-# --- xformers無効化 / INT8 attention有効化の環境変数セット ---
+# --- xformers無効化の環境変数セット ---
 # models import前に必ず立てる必要があるため argparse より前で sys.argv を peek する。
 _ARGV = sys.argv[1:]
 if "--xformers_off" in _ARGV:
     os.environ.setdefault("XFORMERS_DISABLED", "1")
-if "--no_int8_attn" in _ARGV:
-    os.environ.pop("SAT_HMR_INT8_ATTENTION", None)
-elif "--int8_attn" in _ARGV:
-    os.environ.setdefault("SAT_HMR_INT8_ATTENTION", "1")
 
 
 def split_torch_logs_out_per_run():
@@ -70,7 +66,6 @@ def _run_log_dir_from_argv(argv):
         return output_dir
     for path in (
         _argv_value(argv, "--metrics_csv"),
-        _argv_value(argv, "--pred_npz"),
         _argv_value(argv, "--output", "-o"),
     ):
         if not path:
@@ -162,11 +157,6 @@ from sathmr_common import (
 )
 
 SEED = 42
-DTYPE_DEBUG_ONCE = {
-    'model': False,
-    'img': False,
-    'smpl': False,
-}
 
 
 setup_reproducibility(SEED)
@@ -260,21 +250,14 @@ def get_args():
     parser.add_argument('--conf_thresh', type=float, default=0.3, help='検出信頼度閾値')
     parser.add_argument('--weights', default='./weights/sat_hmr/sat_644.pth', help='重みファイルパス')
     parser.add_argument('--input_size', type=int, default=1288, help='入力画像サイズ')
-    parser.add_argument('--batch_size', type=int, default=1, help='推論バッチサイズ（デフォルト: 1）')
     parser.add_argument('--device', default='cuda', help='デバイス')
-    parser.add_argument("--dtype_cfg", default="FP32", help="変数の型(fp32, bfloat16, int8)")
-    parser.add_argument('--torchao_int8', action='store_true', help='[後方互換] --ptq_mode int8_dynamic の alias')
+    parser.add_argument("--dtype_cfg", default="FP32",
+                        help="モデル・入力の型 (fp32 / bfloat16)。INT8 は --ptq_mode int8_dynamic で指定する")
     parser.add_argument('--ptq_mode',
-                        choices=['none', 'int8_dynamic', 'int8_weight_only', 'int4_weight_only'],
+                        choices=['none', 'int8_dynamic'],
                         default='none',
                         help='torchao PTQ スキーム')
-    parser.add_argument('--int8_skip_modules', nargs='*', default=[],
-                        help='int8_dynamic 量子化から外す module 名パターン')
-    parser.add_argument('--int4_group_size', type=int, default=128, help='INT4 weight-only の group_size')
-    parser.add_argument('--int4_skip_modules', nargs='*', default=[], help='INT4量子化スキップする module 名パターン')
     parser.add_argument('--xformers_off', action='store_true', help='XFORMERS_DISABLED=1 を setdefault')
-    parser.add_argument('--int8_attn', action='store_true', help='SAT_HMR_INT8_ATTENTION=1 を setdefault')
-    parser.add_argument('--no_int8_attn', action='store_true', help='SAT_HMR_INT8_ATTENTIONを無効化')
     parser.add_argument('--compile', action='store_true', help='torch.compile(model) を有効化')
     parser.add_argument('--compile_mode', default='default',
                         choices=['default', 'reduce-overhead', 'max-autotune', 'max-autotune-no-cudagraphs'],
@@ -302,23 +285,10 @@ def get_args():
                         help='UDP HELLO を待ってから空回しする (デフォルト: HELLO 待ち前)')
     parser.add_argument('--no_prewarm_rewind', action='store_true',
                         help='動画入力でも空回し後に先頭へ戻さない')
-    parser.add_argument('--static_int8_fused_mlp', action='store_true',
-                        help='[experimental] encoder DINO MLP / decoder FFN を static W8A8 fused Triton kernel に置換する')
-    parser.add_argument('--static_int8_calibration_frames', type=int, default=8,
-                        help='static int8 系 (--static_int8_fused_mlp / --static_scale_int8_decoder_ffn) の calibration に使う frame 数')
-    parser.add_argument('--static_scale_int8_decoder_ffn', action='store_true',
-                        help='decoder の linear1/linear2 を compile-native static-scale INT8 Linear に置換する (Triton 不使用、Inductor fusion 維持)')
-    parser.add_argument('--profile_forward', action='store_true',
-                        help='model forward 内の encoder/decoder/head/SMPL 時間をログ出力')
-    parser.add_argument('--profile_forward_frames', type=int, default=10,
-                        help='--profile_forward で計測する forward 回数')
-    parser.add_argument('--profile_encoder_blocks', action='store_true',
-                        help='--profile_forward 時に encoder block ごとの時間もログ出力')
     parser.add_argument('--show_fps', action='store_true', help='FPS/処理時間を画面に重畳表示')
     parser.add_argument('--display', action='store_true', help='画面表示を有効化（デフォルト: 無効）')
     parser.add_argument('--no_save', action='store_true', help='保存しない')
     parser.add_argument('--metrics_csv', default=None, help='フレーム毎の測定CSV出力パス')
-    parser.add_argument('--pred_npz', default=None, help='フレーム毎の予測NPZ出力パス（pseudo-GT比較用）')
     parser.add_argument('--no_render', action='store_true', help='メッシュ描画スキップ')
     parser.add_argument('--udp_only', action='store_true', help='UE送信専用モード（描画/表示を無効化）')
     parser.add_argument('--udp', action='store_true', help='UEへUDP送信を有効化')
@@ -427,9 +397,6 @@ def _postprocess_and_render(
             poses_dev = torch.from_numpy(poses_t).to(device=device, dtype=tensor_dtype, non_blocking=True)
             betas_dev = torch.from_numpy(betas_t).to(device=device, dtype=tensor_dtype, non_blocking=True)
             transl_dev = torch.from_numpy(transl_t).to(device=device, dtype=tensor_dtype, non_blocking=True)
-            if not DTYPE_DEBUG_ONCE['smpl']:
-                print(f"[DTYPE] poses_dev dtype: {poses_dev.dtype}, betas_dev dtype: {betas_dev.dtype}")
-                DTYPE_DEBUG_ONCE['smpl'] = True
             verts_smpl, joints_smpl = model.human_model(poses=poses_dev, betas=betas_dev)
             verts_cam = verts_smpl + transl_dev.unsqueeze(1)
             joints_cam = joints_smpl + transl_dev.unsqueeze(1)
@@ -495,9 +462,6 @@ def process_frame(model, frame, input_size, conf_thresh, device, no_render=False
     img_tensor = img_tensor.to(device)
     if use_bf16:
         img_tensor = img_tensor.to(torch.bfloat16)
-    if not DTYPE_DEBUG_ONCE['img']:
-        print(f"[DTYPE] img_tensor dtype: {img_tensor.dtype}")
-        DTYPE_DEBUG_ONCE['img'] = True
 
     targets = [{
         'img_size': torch.tensor(img_size).to(device),
@@ -529,73 +493,6 @@ def process_frame(model, frame, input_size, conf_thresh, device, no_render=False
     )
     times.update(extra_times)
     return result_frame, num_persons, times, udp_candidates, pred_record
-
-
-def process_frames_batch(model, frames, input_size, conf_thresh, device, no_render=False, dtype="FP32"):
-    """複数フレームを1バッチで推論"""
-    use_bf16 = is_bf16(dtype)
-    batch_items = []
-    for frame in frames:
-        t0 = time.time()
-        img_tensor, img_size, orig_size = preprocess_frame(frame, input_size, use_sat=True)
-        img_tensor = img_tensor.to(device)
-        if use_bf16:
-            img_tensor = img_tensor.to(torch.bfloat16)
-        if not DTYPE_DEBUG_ONCE['img']:
-            print(f"[DTYPE] img_tensor dtype: {img_tensor.dtype}")
-            DTYPE_DEBUG_ONCE['img'] = True
-        target = {
-            'img_size': torch.tensor(img_size).to(device),
-            'img_path': 'video_frame'
-        }
-        preprocess_time = time.time() - t0
-        batch_items.append({
-            'frame': frame,
-            'img_tensor': img_tensor,
-            'img_size': img_size,
-            'orig_size': orig_size,
-            'target': target,
-            'preprocess_time': preprocess_time,
-        })
-
-    if not batch_items:
-        return []
-
-    # バッチ推論
-    t0 = time.time()
-    with torch.no_grad():
-        outputs = model(
-            [item['img_tensor'] for item in batch_items],
-            [item['target'] for item in batch_items]
-        )
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    inference_time_each = (time.time() - t0) / len(batch_items)
-
-    results = []
-    for idx, item in enumerate(batch_items):
-        result_frame, num_persons, extra_times, udp_candidates, pred_record = _postprocess_and_render(
-            model=model,
-            outputs=outputs,
-            idx=idx,
-            frame=item['frame'],
-            img_tensor=item['img_tensor'],
-            img_size=item['img_size'],
-            orig_size=item['orig_size'],
-            input_size=input_size,
-            conf_thresh=conf_thresh,
-            device=device,
-            no_render=no_render,
-            dtype=dtype,
-        )
-        times = {
-            'preprocess': item['preprocess_time'],
-            'inference': inference_time_each,
-        }
-        times.update(extra_times)
-        results.append((result_frame, num_persons, times, udp_candidates, pred_record))
-
-    return results
 
 
 def run_prewarm_frames(cap, model, args, device, dtype, total_frames):
@@ -652,16 +549,6 @@ def run_prewarm_frames(cap, model, args, device, dtype, total_frames):
 
 
 FPS_WINDOW_FRAMES = 30
-PRED_RECORD_KEYS = ('joints2d', 'joints3d', 'verts', 'transl', 'bboxes', 'focal_length')
-
-
-def append_pred_record(pred_store, frame_idx, input_path, num_persons, pred_record):
-    """Accumulate one frame of predictions for the --pred_npz output."""
-    pred_store['frame_ids'].append(frame_idx)
-    pred_store['image_paths'].append(f"{input_path}#frame_{frame_idx:06d}")
-    pred_store['person_counts'].append(num_persons)
-    for key in PRED_RECORD_KEYS:
-        pred_store[key].append(pred_record[key])
 
 
 def update_fps_window(fps_queue, current_fps):
@@ -727,50 +614,11 @@ def print_first_frame_done(frame_idx, processing_start_time, times):
     )
 
 
-def read_calibration_frames(video_path, num_frames):
-    """Read up to num_frames frames from the start of the video with a separate capture."""
-    calib_cap = cv2.VideoCapture(video_path)
-    frames = []
-    for _ in range(num_frames):
-        ok, frame = calib_cap.read()
-        if not ok:
-            break
-        frames.append(frame)
-    calib_cap.release()
-    return frames
-
-
-def run_calibration_forward(model, frames, input_size, device, use_bf16):
-    """Forward calibration frames so that registered hooks can record activation ranges.
-
-    model.eval() is normally called later in main(); force eval mode here to skip
-    training-only paths (DN, prepare_for_cdn), then restore the previous mode.
-    """
-    prev_training = model.training
-    model.eval()
-    with torch.no_grad():
-        for frame in frames:
-            img_tensor, img_size, _orig_size = preprocess_frame(frame, input_size, use_sat=True)
-            img_tensor = img_tensor.to(device)
-            if use_bf16:
-                img_tensor = img_tensor.to(torch.bfloat16)
-            targets = [{
-                'img_size': torch.tensor(img_size).to(device),
-                'img_path': 'calibration',
-            }]
-            model([img_tensor], targets)
-    if prev_training:
-        model.train()
-
-
 def main():
     args = get_args()
 
     if args.input_size % 56 != 0:
         print(f"エラー: input_size ({args.input_size}) は56の倍数である必要があります")
-        sys.exit(1)
-    if args.batch_size < 1:
-        print("エラー: batch_size は1以上で指定してください")
         sys.exit(1)
     if not args.display:
         args.no_render = True
@@ -805,7 +653,6 @@ def main():
     args.output = resolve_output_path(args.output, args.output_dir, 'output')
     output_side_dir = os.path.dirname(args.output) or args.output_dir or os.getcwd()
     args.metrics_csv = resolve_output_path(args.metrics_csv, args.output_dir, 'metrics_csv', output_side_dir)
-    args.pred_npz = resolve_output_path(args.pred_npz, args.output_dir, 'pred_npz', output_side_dir)
 
     writer = None
     if not args.no_save:
@@ -837,9 +684,6 @@ def main():
     model = model.to(device)
     if use_bf16:
         model = model.to(torch.bfloat16)
-    # 後方互換: 旧 --torchao_int8 フラグを --ptq_mode int8_dynamic にマップ
-    if args.torchao_int8 and args.ptq_mode == 'none':
-        args.ptq_mode = 'int8_dynamic'
 
     # env_check（量子化適用前に1回）
     try:
@@ -847,28 +691,12 @@ def main():
     except Exception:
         _XA = None
     print(f"[ENV] XFORMERS_DISABLED={os.environ.get('XFORMERS_DISABLED')} "
-          f"SAT_HMR_INT8_ATTENTION={os.environ.get('SAT_HMR_INT8_ATTENTION')} "
           f"XFORMERS_AVAILABLE(attention)={_XA}")
 
-    if args.ptq_mode != 'none':
+    if args.ptq_mode == 'int8_dynamic':
         try:
-            from engines.engine import apply_torchao_int8, apply_torchao_int4
-            if args.ptq_mode == 'int8_dynamic':
-                qcfg_name = apply_torchao_int8(
-                    model,
-                    weight_only=False,
-                    skip_modules=tuple(args.int8_skip_modules),
-                )
-            elif args.ptq_mode == 'int8_weight_only':
-                qcfg_name = apply_torchao_int8(model, weight_only=True)
-            elif args.ptq_mode == 'int4_weight_only':
-                if not use_bf16:
-                    model = model.to(torch.bfloat16)
-                qcfg_name = apply_torchao_int4(
-                    model,
-                    skip_modules=tuple(args.int4_skip_modules),
-                    group_size=args.int4_group_size,
-                )
+            from engines.engine import apply_torchao_int8
+            qcfg_name = apply_torchao_int8(model)
             print(f"[INFO] PTQ applied: {args.ptq_mode} ({qcfg_name})")
         except Exception as e:
             print(f"[ERROR] PTQ apply failed (mode={args.ptq_mode}): {e}")
@@ -881,82 +709,6 @@ def main():
             print("[INFO] Static eval buffers prepared before compile")
         except Exception as e:
             print(f"[WARN] prepare_static_eval_buffers failed before compile: {e}")
-
-    # Static W8A8 fused MLP/FFN replacement (after PTQ, before compile)
-    if args.static_int8_fused_mlp:
-        try:
-            from models.static_int8_fused import (
-                StaticInt8FusedMLP,
-                CalibrationHooks,
-                enumerate_hot_targets,
-                apply_static_int8_fused,
-            )
-            if not StaticInt8FusedMLP.is_supported():
-                print("[WARN] Triton not available, skipping --static_int8_fused_mlp")
-            else:
-                hot_targets = enumerate_hot_targets(model)
-                print(f"[INFO] static_int8_fused_mlp: {len(hot_targets)} hot targets identified")
-                if hot_targets:
-                    # --- Calibration ---
-                    n_calib = max(1, args.static_int8_calibration_frames)
-                    print(f"[INFO] static_int8_fused_mlp: calibrating with {n_calib} frame(s)")
-                    calib_frames = read_calibration_frames(args.input, n_calib)
-                    if not calib_frames:
-                        print("[WARN] no calibration frames available, skipping")
-                    else:
-                        with CalibrationHooks(hot_targets) as hooks:
-                            run_calibration_forward(model, calib_frames, args.input_size, device, use_bf16)
-                            scales_dict = hooks.scales()
-                        # --- Replacement ---
-                        n_replaced = apply_static_int8_fused(model, scales_dict)
-                        scale_preview = ", ".join(
-                            f"{k.split('/')[-1]}=({s[0]:.4g},{s[1]:.4g})"
-                            for k, s in list(scales_dict.items())[:3]
-                        )
-                        print(
-                            f"[INFO] static_int8_fused_mlp: replaced {n_replaced}/{len(hot_targets)} modules "
-                            f"(sample scales: {scale_preview})"
-                        )
-        except Exception as e:
-            import traceback
-            print(f"[ERROR] static_int8_fused_mlp setup failed: {e}")
-            traceback.print_exc()
-            sys.exit(1)
-
-    # L3: compile-native static-scale INT8 decoder FFN replacement
-    if args.static_scale_int8_decoder_ffn:
-        try:
-            from models.static_int8_fused import (
-                enumerate_decoder_ffn_linears,
-                LinearCalibrationHooks,
-                apply_static_scale_int8_decoder_ffn,
-            )
-            ffn_targets = enumerate_decoder_ffn_linears(model)
-            print(f"[INFO] static_scale_int8_decoder_ffn: {len(ffn_targets)} linear targets")
-            if ffn_targets:
-                n_calib = max(1, args.static_int8_calibration_frames)
-                print(f"[INFO] static_scale_int8_decoder_ffn: calibrating with {n_calib} frame(s)")
-                calib_frames = read_calibration_frames(args.input, n_calib)
-                if not calib_frames:
-                    print("[WARN] no calibration frames available, skipping")
-                else:
-                    with LinearCalibrationHooks(ffn_targets) as hooks:
-                        run_calibration_forward(model, calib_frames, args.input_size, device, use_bf16)
-                        ffn_scales = hooks.scales()
-                    n_replaced = apply_static_scale_int8_decoder_ffn(model, ffn_scales)
-                    sample = ", ".join(
-                        f"{k.split('/')[-1]}={s:.4g}"
-                        for k, s in list(ffn_scales.items())[:3]
-                    )
-                    print(
-                        f"[INFO] static_scale_int8_decoder_ffn: replaced {n_replaced}/{len(ffn_targets)} "
-                        f"(sample scales: {sample})"
-                    )
-        except Exception as e:
-            import traceback
-            print(f"[ERROR] static_scale_int8_decoder_ffn setup failed: {e}")
-            traceback.print_exc()
-            sys.exit(1)
 
     if args.compile:
         if args.compile_encoder_only and args.compile_disable_encoder:
@@ -1069,29 +821,9 @@ def main():
             print(f"[ERROR] torch.compile init failed: {e}")
             sys.exit(1)
     model.eval()
-    if args.profile_forward:
-        model._sat_profile_forward = True
-        model._sat_profile_forward_limit = args.profile_forward_frames
-        model._sat_profile_forward_count = 0
-        model._sat_profile_encoder_blocks = args.profile_encoder_blocks
-        print(f"[INFO] forward profile enabled: frames={args.profile_forward_frames}")
-        if args.profile_encoder_blocks:
-            print("[INFO] encoder block profile enabled")
-    if not DTYPE_DEBUG_ONCE['model']:
-        print(f"[DTYPE] model dtype: {next(model.parameters()).dtype}")
-        DTYPE_DEBUG_ONCE['model'] = True
-
-    if device.type != 'cuda' and args.batch_size > 1:
-        print("[WARN] batch_size > 1 はCUDA実行のみ対応のため batch_size=1 にフォールバックします")
-        args.batch_size = 1
-    if args.batch_size > 1 and args.udp:
-        print("[INFO] batch_size > 1 のため UDP送信を無効化します")
-        args.udp = False
-        args.udp_only = False
 
     print(f"デバイス: {device}")
     print(f"入力サイズ: {args.input_size}")
-    print(f"バッチサイズ: {args.batch_size}")
     print(f"信頼度閾値: {args.conf_thresh}")
     if args.prewarm_frames > 0:
         print(
@@ -1153,8 +885,6 @@ def main():
             'udp_enabled',
         ])
 
-    pred_store = {key: [] for key in ('frame_ids', 'image_paths', 'person_counts') + PRED_RECORD_KEYS}
-
     sock = None
     ue_host = None
     first_send_done = False
@@ -1187,247 +917,173 @@ def main():
             run_prewarm_frames(cap, model, args, device, dtype, total_frames)
 
     try:
-        if args.batch_size == 1:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-                start_time = time.time()
-                if jump_cooldown_left > 0:
-                    jump_cooldown_left -= 1
-                if jump_hold_left > 0:
-                    jump_hold_left -= 1
+            start_time = time.time()
+            if jump_cooldown_left > 0:
+                jump_cooldown_left -= 1
+            if jump_hold_left > 0:
+                jump_hold_left -= 1
 
-                result_frame, num_persons, times, udp_candidates, pred_record = process_frame(
-                    model, frame, args.input_size, args.conf_thresh, device,
-                    no_render=args.no_render, dtype=dtype
+            result_frame, num_persons, times, udp_candidates, pred_record = process_frame(
+                model, frame, args.input_size, args.conf_thresh, device,
+                no_render=args.no_render, dtype=dtype
+            )
+            total_persons += num_persons
+
+            for k, v in times.items():
+                all_times[k].append(v)
+
+            if args.udp:
+                udp_data, tracker_state, track_reason = select_udp_target(
+                    udp_candidates,
+                    tracker_state,
+                    args.udp_track_max_dist_cm,
+                    args.udp_reinit_conf,
                 )
-                total_persons += num_persons
 
-                if args.pred_npz:
-                    append_pred_record(pred_store, frame_idx, args.input, num_persons, pred_record)
+                if udp_data is None:
+                    outlier_skip_streak = 0
+                    jump_candidate_streak = 0
+                    tracker_state['missed'] += 1
+                    if tracker_state['missed'] > args.udp_hold_frames:
+                        tracker_state['active'] = False
+                        tracker_state['transl'] = None
+                        tracker_state['query_id'] = None
+                    if frame_idx % 30 == 0:
+                        print(f"UDP frame={frame_idx} skip ({track_reason}) persons={num_persons}")
+                else:
+                    quaternions = smpl_pose_to_ue_quaternions(udp_data['pose'])
+                    trans = transl_to_ue(udp_data['transl'])
 
-                for k, v in times.items():
-                    all_times[k].append(v)
+                    if np.isfinite(quaternions).all() and np.isfinite(trans).all():
+                        raw_trans_motion = 0.0 if prev_trans is None else float(np.linalg.norm(trans - prev_trans))
+                        raw_pose_motion = 0.0 if prev_quat is None else float(np.mean(np.abs(quaternions - prev_quat)))
 
-                if args.udp:
-                    udp_data, tracker_state, track_reason = select_udp_target(
-                        udp_candidates,
-                        tracker_state,
-                        args.udp_track_max_dist_cm,
-                        args.udp_reinit_conf,
-                    )
+                        outlier_note = ""
+                        send_trans = trans.copy()
+                        skip_send = False
 
-                    if udp_data is None:
-                        outlier_skip_streak = 0
-                        jump_candidate_streak = 0
-                        tracker_state['missed'] += 1
-                        if tracker_state['missed'] > args.udp_hold_frames:
-                            tracker_state['active'] = False
-                            tracker_state['transl'] = None
-                            tracker_state['query_id'] = None
-                        if frame_idx % 30 == 0:
-                            print(f"UDP frame={frame_idx} skip ({track_reason}) persons={num_persons}")
-                    else:
-                        quaternions = smpl_pose_to_ue_quaternions(udp_data['pose'])
-                        trans = transl_to_ue(udp_data['transl'])
-
-                        if np.isfinite(quaternions).all() and np.isfinite(trans).all():
-                            raw_trans_motion = 0.0 if prev_trans is None else float(np.linalg.norm(trans - prev_trans))
-                            raw_pose_motion = 0.0 if prev_quat is None else float(np.mean(np.abs(quaternions - prev_quat)))
-
-                            outlier_note = ""
-                            send_trans = trans.copy()
-                            skip_send = False
-
-                            jump_armed = False
-                            if prev_trans is not None and jump_cooldown_left == 0:
-                                jump_cond = (
-                                    udp_data['conf'] >= args.udp_jump_conf_thresh and
-                                    (
-                                        raw_trans_motion >= args.udp_jump_motion_cm or
-                                        raw_pose_motion >= args.udp_jump_pose_motion
-                                    )
+                        jump_armed = False
+                        if prev_trans is not None and jump_cooldown_left == 0:
+                            jump_cond = (
+                                udp_data['conf'] >= args.udp_jump_conf_thresh and
+                                (
+                                    raw_trans_motion >= args.udp_jump_motion_cm or
+                                    raw_pose_motion >= args.udp_jump_pose_motion
                                 )
-                                if jump_cond:
-                                    jump_candidate_streak += 1
-                                    if jump_candidate_streak >= max(1, args.udp_jump_debounce):
-                                        jump_hold_left = max(jump_hold_left, args.udp_jump_hold_frames)
-                                        jump_candidate_streak = 0
-                                else:
+                            )
+                            if jump_cond:
+                                jump_candidate_streak += 1
+                                if jump_candidate_streak >= max(1, args.udp_jump_debounce):
+                                    jump_hold_left = max(jump_hold_left, args.udp_jump_hold_frames)
                                     jump_candidate_streak = 0
                             else:
                                 jump_candidate_streak = 0
+                        else:
+                            jump_candidate_streak = 0
 
-                            if jump_hold_left > 0:
-                                jump_armed = True
-                                outlier_skip_streak = 0
-                                outlier_note = f" jump_bypass(hold={jump_hold_left})"
+                        if jump_hold_left > 0:
+                            jump_armed = True
+                            outlier_skip_streak = 0
+                            outlier_note = f" jump_bypass(hold={jump_hold_left})"
 
-                            if (not jump_armed) and prev_trans is not None and args.udp_trans_jump_cm > 0 and raw_trans_motion > args.udp_trans_jump_cm:
-                                if args.udp_outlier_mode == 'skip':
-                                    outlier_skip_streak += 1
-                                    if outlier_skip_streak <= args.udp_outlier_max_skip:
-                                        skip_send = True
-                                        outlier_note = (
-                                            f"trans_outlier {raw_trans_motion:.2f}>{args.udp_trans_jump_cm:.2f}cm "
-                                            f"(skip {outlier_skip_streak}/{args.udp_outlier_max_skip})"
-                                        )
-                                    else:
-                                        outlier_note = (
-                                            f" outlier=rebase({raw_trans_motion:.2f}cm "
-                                            f"after {outlier_skip_streak} skips)"
-                                        )
-                                        outlier_skip_streak = 0
-                                else:
-                                    delta = trans - prev_trans
-                                    scale = args.udp_trans_jump_cm / (raw_trans_motion + 1e-9)
-                                    send_trans = prev_trans + delta * scale
+                        if (not jump_armed) and prev_trans is not None and args.udp_trans_jump_cm > 0 and raw_trans_motion > args.udp_trans_jump_cm:
+                            if args.udp_outlier_mode == 'skip':
+                                outlier_skip_streak += 1
+                                if outlier_skip_streak <= args.udp_outlier_max_skip:
+                                    skip_send = True
                                     outlier_note = (
-                                        f" outlier=clamp({raw_trans_motion:.2f}"
-                                        f"->{args.udp_trans_jump_cm:.2f}cm)"
+                                        f"trans_outlier {raw_trans_motion:.2f}>{args.udp_trans_jump_cm:.2f}cm "
+                                        f"(skip {outlier_skip_streak}/{args.udp_outlier_max_skip})"
+                                    )
+                                else:
+                                    outlier_note = (
+                                        f" outlier=rebase({raw_trans_motion:.2f}cm "
+                                        f"after {outlier_skip_streak} skips)"
                                     )
                                     outlier_skip_streak = 0
                             else:
+                                delta = trans - prev_trans
+                                scale = args.udp_trans_jump_cm / (raw_trans_motion + 1e-9)
+                                send_trans = prev_trans + delta * scale
+                                outlier_note = (
+                                    f" outlier=clamp({raw_trans_motion:.2f}"
+                                    f"->{args.udp_trans_jump_cm:.2f}cm)"
+                                )
                                 outlier_skip_streak = 0
+                        else:
+                            outlier_skip_streak = 0
 
-                            if skip_send:
-                                if frame_idx % 30 == 0:
-                                    print(f"UDP frame={frame_idx} skip ({outlier_note}) persons={num_persons}")
+                        if skip_send:
+                            if frame_idx % 30 == 0:
+                                print(f"UDP frame={frame_idx} skip ({outlier_note}) persons={num_persons}")
+                        else:
+                            pose_str = ",".join(f"{v:.4f}" for v in quaternions.flatten())
+                            trans_str = ",".join(f"{v:.4f}" for v in send_trans.flatten())
+                            payload = f"{pose_str}|{trans_str}\n".encode("ascii")
+                            sent = sock.sendto(payload, (ue_host, args.ue_port))
+
+                            if not first_send_done:
+                                startup_lag = time.perf_counter() - time_connection_success
+                                print(f"[INFO] Startup Lag: {startup_lag:.4f} seconds")
+                                first_send_done = True
+
+                            if prev_quat is None:
+                                pose_motion = 0.0
+                                trans_motion = 0.0
                             else:
-                                pose_str = ",".join(f"{v:.4f}" for v in quaternions.flatten())
-                                trans_str = ",".join(f"{v:.4f}" for v in send_trans.flatten())
-                                payload = f"{pose_str}|{trans_str}\n".encode("ascii")
-                                sent = sock.sendto(payload, (ue_host, args.ue_port))
+                                pose_motion = raw_pose_motion
+                                trans_motion = float(np.linalg.norm(send_trans - prev_trans))
 
-                                if not first_send_done:
-                                    startup_lag = time.perf_counter() - time_connection_success
-                                    print(f"[INFO] Startup Lag: {startup_lag:.4f} seconds")
-                                    first_send_done = True
+                            prev_quat = quaternions.copy()
+                            prev_trans = send_trans.copy()
 
-                                if prev_quat is None:
-                                    pose_motion = 0.0
-                                    trans_motion = 0.0
-                                else:
-                                    pose_motion = raw_pose_motion
-                                    trans_motion = float(np.linalg.norm(send_trans - prev_trans))
+                            if jump_armed and jump_hold_left == 1:
+                                jump_cooldown_left = max(0, args.udp_jump_cooldown)
 
-                                prev_quat = quaternions.copy()
-                                prev_trans = send_trans.copy()
-
-                                if jump_armed and jump_hold_left == 1:
-                                    jump_cooldown_left = max(0, args.udp_jump_cooldown)
-
-                                if frame_idx % 30 == 0:
-                                    print(
-                                        f"UDP frame={frame_idx} conf={udp_data['conf']:.3f} "
-                                        f"persons={udp_data['num_persons']} query={udp_data['query_id']} "
-                                        f"reason={track_reason} pose_motion={pose_motion:.5f} "
-                                        f"trans_motion={trans_motion:.2f}{outlier_note} sent={sent}"
-                                    )
-                        elif frame_idx % 30 == 0:
-                            print(f"UDP frame={frame_idx} skip (invalid payload) persons={num_persons}")
-
-                elapsed = time.time() - start_time
-                if not first_frame_done:
-                    print_first_frame_done(frame_idx, processing_start_time, times)
-                    first_frame_done = True
-                current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
-                avg_fps_30 = update_fps_window(fps_queue, current_fps)
-                if metrics_writer is not None:
-                    metrics_writer.writerow(metrics_csv_row(
-                        frame_idx, num_persons, times, elapsed, current_fps, avg_fps_30, int(args.udp)))
-                    metrics_fp.flush()
-
-                if writer is not None:
-                    writer.write(result_frame)
-
-                if args.show_fps and args.display:
-                    draw_timing_overlay(result_frame, current_fps, num_persons, times)
-
-                if args.display:
-                    cv2.imshow('SAT-HMR Video Demo', result_frame)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q') or key == 27:
-                        print("\n中断されました")
-                        break
-                elif frame_idx % 30 == 0:
-                    print_frame_status(frame_idx, total_frames, current_fps, num_persons, times)
-
-                frame_idx += 1
-                pbar.update(1)
-                pbar.set_postfix({'persons': num_persons, 'fps': f'{current_fps:.1f}'})
-        else:
-            stop_requested = False
-            while not stop_requested:
-                batch_frames = []
-                while len(batch_frames) < args.batch_size:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    batch_frames.append(frame)
-
-                if not batch_frames:
-                    break
-
-                batch_results = process_frames_batch(
-                    model=model,
-                    frames=batch_frames,
-                    input_size=args.input_size,
-                    conf_thresh=args.conf_thresh,
-                    device=device,
-                    no_render=args.no_render,
-                    dtype=dtype,
-                )
-
-                for result_frame, num_persons, times, _udp_candidates, pred_record in batch_results:
-                    total_persons += num_persons
-
-                    if args.pred_npz:
-                        append_pred_record(pred_store, frame_idx, args.input, num_persons, pred_record)
-
-                    for k, v in times.items():
-                        all_times[k].append(v)
-
-                    elapsed = (
-                        times.get('preprocess', 0.0)
-                        + times.get('inference', 0.0)
-                        + times.get('postprocess', 0.0)
-                        + times.get('render', 0.0)
-                    )
-                    if not first_frame_done:
-                        print_first_frame_done(frame_idx, processing_start_time, times)
-                        first_frame_done = True
-                    current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
-                    avg_fps_30 = update_fps_window(fps_queue, current_fps)
-
-                    if metrics_writer is not None:
-                        # Batched inference never sends UDP (it is disabled for batch_size > 1).
-                        metrics_writer.writerow(metrics_csv_row(
-                            frame_idx, num_persons, times, elapsed, current_fps, avg_fps_30, 0))
-                        metrics_fp.flush()
-
-                    if writer is not None:
-                        writer.write(result_frame)
-
-                    if args.show_fps and args.display:
-                        draw_timing_overlay(result_frame, current_fps, num_persons, times)
-
-                    if args.display:
-                        cv2.imshow('SAT-HMR Video Demo', result_frame)
-                        key = cv2.waitKey(1) & 0xFF
-                        if key == ord('q') or key == 27:
-                            print("\n中断されました")
-                            stop_requested = True
-                            break
+                            if frame_idx % 30 == 0:
+                                print(
+                                    f"UDP frame={frame_idx} conf={udp_data['conf']:.3f} "
+                                    f"persons={udp_data['num_persons']} query={udp_data['query_id']} "
+                                    f"reason={track_reason} pose_motion={pose_motion:.5f} "
+                                    f"trans_motion={trans_motion:.2f}{outlier_note} sent={sent}"
+                                )
                     elif frame_idx % 30 == 0:
-                        print_frame_status(frame_idx, total_frames, current_fps, num_persons, times)
+                        print(f"UDP frame={frame_idx} skip (invalid payload) persons={num_persons}")
 
-                    frame_idx += 1
-                    pbar.update(1)
-                    pbar.set_postfix({'persons': num_persons, 'fps': f'{current_fps:.1f}'})
+            elapsed = time.time() - start_time
+            if not first_frame_done:
+                print_first_frame_done(frame_idx, processing_start_time, times)
+                first_frame_done = True
+            current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
+            avg_fps_30 = update_fps_window(fps_queue, current_fps)
+            if metrics_writer is not None:
+                metrics_writer.writerow(metrics_csv_row(
+                    frame_idx, num_persons, times, elapsed, current_fps, avg_fps_30, int(args.udp)))
+                metrics_fp.flush()
 
+            if writer is not None:
+                writer.write(result_frame)
+
+            if args.show_fps and args.display:
+                draw_timing_overlay(result_frame, current_fps, num_persons, times)
+
+            if args.display:
+                cv2.imshow('SAT-HMR Video Demo', result_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    print("\n中断されました")
+                    break
+            elif frame_idx % 30 == 0:
+                print_frame_status(frame_idx, total_frames, current_fps, num_persons, times)
+
+            frame_idx += 1
+            pbar.update(1)
+            pbar.set_postfix({'persons': num_persons, 'fps': f'{current_fps:.1f}'})
     except KeyboardInterrupt:
         print("\n中断されました")
 
@@ -1441,24 +1097,6 @@ def main():
         if metrics_fp is not None:
             metrics_fp.close()
         cv2.destroyAllWindows()
-
-    if args.pred_npz:
-        pred_dir = os.path.dirname(args.pred_npz)
-        if pred_dir:
-            os.makedirs(pred_dir, exist_ok=True)
-        np.savez_compressed(
-            args.pred_npz,
-            frame_ids=np.asarray(pred_store['frame_ids'], dtype=np.int64),
-            image_paths=np.asarray(pred_store['image_paths'], dtype=object),
-            person_counts=np.asarray(pred_store['person_counts'], dtype=np.int32),
-            joints2d=np.asarray(pred_store['joints2d'], dtype=object),
-            joints3d=np.asarray(pred_store['joints3d'], dtype=object),
-            verts=np.asarray(pred_store['verts'], dtype=object),
-            transl=np.asarray(pred_store['transl'], dtype=object),
-            bboxes=np.asarray(pred_store['bboxes'], dtype=object),
-            focal_length=np.asarray(pred_store['focal_length'], dtype=object),
-            failed_frames=np.int32(0),
-        )
 
     print(f"\n処理完了!")
     print(f"処理フレーム数: {frame_idx}")
@@ -1484,8 +1122,6 @@ def main():
         print(f"\n出力: {args.output}")
     if args.metrics_csv:
         print(f"測定CSV: {args.metrics_csv}")
-    if args.pred_npz:
-        print(f"予測NPZ: {args.pred_npz}")
     print(f"実行ログ: {_RUN_LOG_PATH}")
 
 

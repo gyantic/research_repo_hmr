@@ -10,14 +10,11 @@
 
 | カテゴリ | ファイル・ディレクトリ | 内容 |
 |---|---|---|
-| **デモ・UE連携** | [video_demo.py](video_demo.py) | PyTorchによる動画推論、および推定したSMPL姿勢のUnreal EngineへのUDP送信・描画（論文のSAT-HMR速度・精度計測でも使用） |
-| | `video_demo_trt.py` | TensorRTによる動画推論デモ |
-| | `webcam_demo_trt.py` | Webカメラを用いた実時間推論デモ（TensorRT） |
-| **INT8量子化中核** | `models/int8_attention.py`<br>`models/static_int8_fused.py` | INT8量子化のコア実装 |
-| **共通ヘルパー** | `sathmr_common.py` | 前処理、SMPL→UE座標・姿勢変換、UDP通信・追跡などデモおよびベンチマークの共通処理 |
-| | `trt_runner.py` | TensorRTエンジンの実行ラッパー |
-| **ツール群** | [tools/](tools/) | 量子化、TensorRT / ONNXエクスポート、キャリブレーション、TensorRTでの3DPW評価スクリプト群 |
-| **設定ファイル** | `configs/run/eval_3dpw_*.yaml`<br>`configs/run/train_qat.yaml` | 3DPW精度評価およびQAT（量子化認識学習）用の設定ファイル |
+| **デモ・UE連携** | [video_demo.py](video_demo.py) | PyTorchによる動画推論、および推定したSMPL姿勢のUnreal EngineへのUDP送信・描画（論文のSAT-HMR速度計測でも使用） |
+| **量子化** | `engines/engine.py`（`apply_torchao_int8`） | torchao による動的INT8量子化（`video_demo.py --ptq_mode int8_dynamic` と 3DPW 評価で使用） |
+| **共通ヘルパー** | `sathmr_common.py` | 前処理、INT8重みファイルの展開、SMPL→UE座標・姿勢変換、UDP通信・追跡などの共通処理 |
+| **ツール** | `tools/quantize_weights_int8.py` | 重みをINT8で保存し直すスクリプト（`sat_644_int8w.pth` の作成に使用） |
+| **設定ファイル** | `configs/run/eval_3dpw_bf16.yaml`<br>`configs/run/eval_3dpw_int8w_dynamic.yaml` | 3DPW精度評価（bf16 / INT8）用の設定ファイル（fp32 は上流の `eval_3dpw.yaml`） |
 
 ---
 

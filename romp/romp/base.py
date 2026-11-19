@@ -14,6 +14,7 @@ import config
 import constants
 from config import args, parse_args, ConfigContext
 from models import build_model
+from models.base import apply_model_precision
 from models.balanced_dataparallel import DataParallel
 from utils import *
 from utils.projection import vertices_kp3d_projection
@@ -56,9 +57,9 @@ class Base(object):
                 model = load_model(self.model_path, model, prefix = 'module.', drop_prefix=drop_prefix, fix_loaded=False)
                 train_entire_model(model)
         # --- precision / quantization (inference only) ---
-        if self.model_precision == 'bf16':
-            model = model.to(torch.bfloat16)
-            logging.info('[bf16] model converted to bfloat16.')
+        model = apply_model_precision(model, self.model_precision)
+        if self.model_precision != 'fp32':
+            logging.info('[%s] model weights cast by apply_model_precision.', self.model_precision)
         if getattr(self, 'torchao_int8_weight_only', False):
             model = model.cuda()  # torchao quantize_ requires CUDA
             try:

@@ -3,8 +3,7 @@
 autocast（実行時キャスト）ではなく、チェックポイント内の fp32 テンソルを
 実際に bf16 へ変換した重みファイルを生成する。fp32 以外（fp16, int 等）は変更しない。
 
-論文表2のサイズ合算レシピは results/measurements/benchmark_manifest_all.csv に従う
-（MB = 1e6 bytes）:
+論文表2のサイズ合算（MB = 1e6 bytes）:
     fp32: model.ckpt 2109.129 + mhr_model.pt 696.110
           + yolo11m-pose.engine 27.864 + moge-2-vits blobs 140.555 = 2973.7 MB
     bf16: model_bf16.ckpt 1907.421 + mhr_model_bf16.pt 350.308
@@ -23,12 +22,11 @@ import torch
 FASTSAM_ROOT = Path(__file__).resolve().parents[2] / "fast-sam-3d-body"
 HF_HUB = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
 OUT_DIR = FASTSAM_ROOT / "checkpoints" / "bf16"
-BYTES_PER_MB = 1e6  # 表2・manifest と同じ定義
+BYTES_PER_MB = 1e6  # 表2と同じ定義
 
 TARGETS = [
     FASTSAM_ROOT / "checkpoints/sam-3d-body-dinov3/model.ckpt",
     FASTSAM_ROOT / "checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt",
-    FASTSAM_ROOT / "checkpoints/yolo/yolo11m-pose.pt",
     HF_HUB
     / "models--Ruicheng--moge-2-vits-normal/snapshots/679230677b4d282c6f304189a93e98e14f085902/model.pt",
 ]

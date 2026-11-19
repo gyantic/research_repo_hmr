@@ -8,33 +8,25 @@ import sys
 import time
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parents[2] / "fast-sam-3d-body"
+# Paths relative to REPO (main() chdirs there before the engines are loaded).
+BACKBONE_ENGINE = "./checkpoints/sam-3d-body-dinov3/backbone_trt/backbone_dinov3_int8.engine"
+FOV_ENGINE = "./checkpoints/moge_trt/moge_dinov2_encoder_int8.engine"
+YOLO_MODEL = "./checkpoints/yolo/yolo11m-pose.engine"
+BBOX_THRESH = 0.5
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[2] / "fast-sam-3d-body"))
     parser.add_argument("--video", required=True)
     parser.add_argument("--output_csv", required=True)
     parser.add_argument("--warmup_frames", type=int, default=10)
-    parser.add_argument("--max_frames", type=int, default=0)
     parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--bbox_thresh", type=float, default=0.5)
     parser.add_argument(
         "--dtype_variant",
-        choices=["fp32", "bf16", "int8", "int8_bf16"],
+        choices=["fp32", "bf16", "int8"],
         default="int8",
         help="Precision/engine variant to benchmark.",
-    )
-    parser.add_argument(
-        "--backbone_engine",
-        default="./checkpoints/sam-3d-body-dinov3/backbone_trt/backbone_dinov3_int8.engine",
-    )
-    parser.add_argument(
-        "--fov_engine",
-        default="./checkpoints/moge_trt/moge_dinov2_encoder_int8.engine",
-    )
-    parser.add_argument(
-        "--yolo_model",
-        default="./checkpoints/yolo/yolo11m-pose.engine",
     )
     parser.add_argument(
         "--checkpoint_path",
@@ -69,7 +61,6 @@ DTYPE_VARIANT_ENV = {
     # bf16 runs eager: compile / CUDA graph caused a mixed-dtype addmm failure.
     "bf16": {"LAYER_DTYPE": "bf16", "USE_TRT_BACKBONE": "0", "FOV_TRT": "0", **COMPILE_DISABLED_ENV},
     "int8": {},
-    "int8_bf16": {"LAYER_DTYPE": "bf16", "MHR_USE_CUDA_GRAPH": "0"},
 }
 
 
@@ -90,7 +81,7 @@ def set_perf_env(args):
         "IMG_SIZE": str(args.image_size),
         "MHR_NO_CORRECTIVES": "1",
         "FOV_TRT": "1",
-        "FOV_TRT_PATH": args.fov_engine,
+        "FOV_TRT_PATH": FOV_ENGINE,
         "FOV_FAST": "1",
         "FOV_MODEL": "s",
         "FOV_LEVEL": "0",
@@ -103,7 +94,7 @@ def set_perf_env(args):
         "COMPILE_MODE": "reduce-overhead",
         "COMPILE_WARMUP_BATCH_SIZES": "1",
         "USE_TRT_BACKBONE": "1",
-        "TRT_BACKBONE_PATH": args.backbone_engine,
+        "TRT_BACKBONE_PATH": BACKBONE_ENGINE,
         "TORCHINDUCTOR_CACHE_DIR": os.path.expanduser("~/.cache/torchinductor"),
         "TRITON_CACHE_DIR": os.path.expanduser("~/.cache/triton"),
     }
@@ -117,9 +108,8 @@ def main():
     args = parse_args()
     set_perf_env(args)
 
-    repo = Path(args.repo).resolve()
-    os.chdir(repo)
-    sys.path.insert(0, str(repo))
+    os.chdir(REPO)
+    sys.path.insert(0, str(REPO))
 
     # Deferred imports: the Fast-SAM-3D-Body modules read the env set above at import time.
     import cv2
@@ -132,7 +122,7 @@ def main():
     output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     print("[INFO] Loading Fast-SAM-3D-Body estimator")
-    print(f"[INFO] repo={repo}")
+    print(f"[INFO] repo={REPO}")
     print(f"[INFO] video={args.video}")
     print(f"[INFO] dtype_variant={args.dtype_variant}")
     print(f"[INFO] LAYER_DTYPE={os.environ.get('LAYER_DTYPE')}")
@@ -147,7 +137,7 @@ def main():
 
     estimator = build_default_estimator(
         image_size=args.image_size,
-        yolo_model_path=args.yolo_model,
+        yolo_model_path=YOLO_MODEL,
         fov_model_size="s",
         fov_resolution_level=0,
         fov_fixed_size=args.image_size,
@@ -175,7 +165,7 @@ def main():
         estimator.last_timings = {}
         _ = estimator.process_one_image(
             frame_rgb,
-            bbox_thr=args.bbox_thresh,
+            bbox_thr=BBOX_THRESH,
             use_mask=False,
             hand_box_source="yolo_pose",
         )
@@ -207,8 +197,6 @@ def main():
 
         frame_idx = 0
         while True:
-            if args.max_frames and frame_idx >= args.max_frames:
-                break
             ok, frame_bgr = cap.read()
             if not ok:
                 break
@@ -221,7 +209,7 @@ def main():
             t0 = time.perf_counter()
             outputs = estimator.process_one_image(
                 frame_rgb,
-                bbox_thr=args.bbox_thresh,
+                bbox_thr=BBOX_THRESH,
                 use_mask=False,
                 hand_box_source="yolo_pose",
             )

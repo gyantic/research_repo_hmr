@@ -1471,7 +1471,7 @@ class SAM3DBody(BaseModel):
             if isinstance(pose_output, dict):
                 for k, v in pose_output.items():
                     if isinstance(v, torch.Tensor) and torch.isnan(v).any():
-                        print(f"          [DEBUG forward_decoder] NaN in pose_output['{k}'] after decoder! shape={v.shape}")
+                        _print(f"          [DEBUG forward_decoder] NaN in pose_output['{k}'] after decoder! shape={v.shape}")
                         break  # Only print first NaN field
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -1898,7 +1898,7 @@ class SAM3DBody(BaseModel):
             if isinstance(pose_output, dict):
                 for k, v in pose_output.items():
                     if isinstance(v, torch.Tensor) and torch.isnan(v).any():
-                        print(f"          [DEBUG forward_decoder_hand] NaN in pose_output['{k}'] after decoder! shape={v.shape}")
+                        _print(f"          [DEBUG forward_decoder_hand] NaN in pose_output['{k}'] after decoder! shape={v.shape}")
                         break  # Only print first NaN field
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -1955,7 +1955,7 @@ class SAM3DBody(BaseModel):
             if pose_out is not None:
                 for k, v in pose_out.items():
                     if isinstance(v, torch.Tensor) and torch.isnan(v).any():
-                        print(f"          [DEBUG _forward_decoders_combined] BODY decoder output '{k}': contains NaN! shape={v.shape}")
+                        _print(f"          [DEBUG _forward_decoders_combined] BODY decoder output '{k}': contains NaN! shape={v.shape}")
 
         # Mark step begin before hand decoder to avoid CUDA graph tensor reuse conflicts
         torch.compiler.cudagraph_mark_step_begin()
@@ -1979,7 +1979,7 @@ class SAM3DBody(BaseModel):
             if pose_out is not None:
                 for k, v in pose_out.items():
                     if isinstance(v, torch.Tensor) and torch.isnan(v).any():
-                        print(f"          [DEBUG _forward_decoders_combined] HAND decoder output '{k}': contains NaN! shape={v.shape}")
+                        _print(f"          [DEBUG _forward_decoders_combined] HAND decoder output '{k}': contains NaN! shape={v.shape}")
 
         return tokens_output_body, pose_output_body, tokens_output_hand, pose_output_hand
 
@@ -2747,7 +2747,7 @@ class SAM3DBody(BaseModel):
             if _DEBUG_NAN:
                 def check_nan(tensor, name):
                     if tensor is not None and torch.isnan(tensor).any():
-                        print(f"          [DEBUG NaN] {name}: contains NaN!")
+                        _print(f"          [DEBUG NaN] {name}: contains NaN!")
                         return True
                     return False
 

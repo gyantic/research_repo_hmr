@@ -1,11 +1,8 @@
 """Helpers shared by the SAT-HMR demo / benchmark scripts.
 
-Used by video_demo.py, video_demo_trt.py, webcam_demo_trt.py and
-engines/engine.py (and, through video_demo.py, by ue/infer_sequential.py).
-
-Only dependencies that every one of those scripts already imports are loaded
-here. Optional heavy backends (TensorRT, cuda-python, Triton) are NOT imported:
-the TensorRT runner lives in trt_runner.py and imports them lazily.
+Used by video_demo.py and engines/engine.py (and, through video_demo.py,
+by ue/infer_sequential.py). The UDP helpers (add_udp_args / print_udp_settings /
+UdpPoseStreamer) are kept for scripts that stream poses to UE.
 """
 
 import math
@@ -89,19 +86,6 @@ def load_config(input_size):
     args.input_size = input_size
 
     return args
-
-
-def resolve_device(mode: str) -> torch.device:
-    """Map "cpu" / "cuda" / anything-else ("auto") to a torch.device, falling back to CPU."""
-    mode = mode.lower()
-    if mode == "cpu":
-        return torch.device("cpu")
-    if mode == "cuda":
-        if not torch.cuda.is_available():
-            print("[WARN] DEVICE_MODE=cuda ですが CUDA が利用できないため CPU にフォールバックします")
-            return torch.device("cpu")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def dequantize_int8_weight_state_dict_if_needed(state_dict):
@@ -327,7 +311,7 @@ def make_udp_candidates(poses, transls, confs, select_idx):
 
 
 # ---------------------------------------------------------------------------
-# UDP streaming to UE (video_demo_trt.py / webcam_demo_trt.py)
+# UDP streaming to UE
 # ---------------------------------------------------------------------------
 
 def add_udp_args(parser):

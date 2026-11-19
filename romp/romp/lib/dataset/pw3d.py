@@ -1,5 +1,4 @@
 import sys, os
-from pathlib import Path
 from dataset.image_base import *
 from dataset.base import Base_Classes, Test_Funcs
 from utils.util import transform_rot_representation
@@ -29,25 +28,6 @@ def PW3D(base_class=default_mode):
             self.split = split
             self.regress_smpl = regress_smpl
             
-            self.sam3d_labels = None
-            sam3d_pkl = '/home/kyuta/ROMP/data/sam3d_labels_b/sam3d_teacher_joints_trainval.pkl'
-            if os.path.exists(sam3d_pkl):
-                try:
-                    with open(sam3d_pkl, "rb") as f:
-                        sys.modules.setdefault("numpy._core", np)
-                        sys.modules.setdefault("numpy._core.multiarray", np.core.multiarray)
-                        self.sam3d_labels = pickle.load(f)
-                    logging.info(f'[SAM3D] loaded labels from {sam3d_pkl}, {len(self.sam3d_labels)} images')
-                    sample_keys = list(self.sam3d_labels.keys())[:5]
-                    for i, k in enumerate(sample_keys):
-                        logging.info(f'[SAM3D] sample key[{i}]: {k}')
-                except Exception as e:
-                    logging.info(f"SAM3D key error: {e}")
-                    logging.info(f"[SAM3D] Error loading: {e}")
-                logging.info(f'[SAM3D] loaded labels from {sam3d_pkl}, {len(self.sam3d_labels)} images')
-            else:
-                logging.info(f'[SAM3D] no labels found at {sam3d_pkl}, distillation OFF')       
-                    
             self.val_sample_ratio = 5
             self.scale_range = [1.1,2.]
             self.dataset_name = {'PC':'pw3d_pc', 'NC':'pw3d_nc','OC':'pw3d_oc','vibe':'pw3d_vibe', 'normal':'pw3d_normal'}[mode]
@@ -121,9 +101,6 @@ def PW3D(base_class=default_mode):
 
         def get_image_info(self, index):
             annots = self.annots[self.file_paths[index%len(self.file_paths)]]
-            # SAM3D teacher pose for distillation; zeros + valid=0 when no label exists.
-            sam3d_pose = np.zeros((72,), dtype=np.float32)
-            sam3d_valid = 0.0
             subject_ids, genders, kp2ds, kp3ds, params, bbox, valid_mask_2d, valid_mask_3d = [[] for i in range(8)]
             root_trans = []
             verts = None
@@ -163,42 +140,11 @@ def PW3D(base_class=default_mode):
             image = cv2.imread(imgpath)[:,:,::-1].copy()        
             valid_masks = np.array([self._check_kp3d_visible_parts_(kp3d) for kp3d in kp3ds])
             kp3ds[~valid_masks] = -2.
-            
-            #ここで SAM3D ラベル
-            if self.sam3d_labels is not None:
-                logging.info(f"sam3d_labels is not None: {self.sam3d_labels is not None}, count: {len(self.sam3d_labels) if self.sam3d_labels else 0}")
-                try:
-                    img_path = Path(imgpath)
-                    # generate_teacher_labels.py と同じ:
-                    # rel_path = img_path.relative_to(data_root / 'imageFiles')
-                    # data_root/imageFiles == self.image_dir なので:
-                    rel1 = img_path.relative_to(self.image_dir)
-                    key1 = str(rel1).replace('\\', '/')
-                    teacher = self.sam3d_labels.get(key1, None)
-                    if teacher is None:
-                        key2 = f"imageFiles/{video_name}/image_{frame_id:05d}.jpg"
-                        teacher = self.sam3d_labels.get(key2, None)
-                    if teacher is not None:
-                        sam3d_pose = np.asarray(teacher['pose'], dtype=np.float32)  # (72,)
-                        sam3d_valid = 1.0
-                except Exception as e:
-                    logging.info(f"SAM3D key error: {e}")
-                    # ラベルが無くても学習は続ける
 
-            img_info = {'imgpath': imgpath, 
-                        'image': image, 
-                        'kp2ds': kp2ds, 
-                        'track_ids': subject_ids,
-                        'vmask_2d': valid_mask_2d, 
-                        'vmask_3d': valid_mask_3d,
-                        'kp3ds': kp3ds,
-                        'params': params,
-                        'root_trans': root_trans,
-                        'verts': verts,
-                        'img_size': image.shape[:2],
-                        'ds': self.dataset_name, 
-                        'sam3d_pose': sam3d_pose,
-                        'sam3d_valid': sam3d_valid,}
+            img_info = {'imgpath': imgpath, 'image': image, 'kp2ds': kp2ds, 'track_ids': subject_ids,\
+                    'vmask_2d': valid_mask_2d, 'vmask_3d': valid_mask_3d,\
+                    'kp3ds': kp3ds, 'params': params, 'root_trans': root_trans, 'verts': verts,\
+                    'img_size': image.shape[:2],'ds': self.dataset_name}
             return img_info
 
         def load_vibe_annots(self):

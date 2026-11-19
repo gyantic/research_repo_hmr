@@ -1,19 +1,24 @@
 """
 ROMP Video Demo  (SAT-HMR video_demo.py に準拠)
 
-速度計測だけしたい場合:
-    python romp_video_demo.py -i demo/videos/sample_video.mp4 \
-        --no_render --no_save \
-        --metrics_csv datas/romp_metrics.csv
+romp/ ディレクトリから PYTHONPATH="$PWD:$PWD/romp" を付けて実行する。
+モデル・数値精度・torch.compile の有無は --configs_yml の YAML で指定する
+（論文の計測設定は ../measurements/romp/configs/、計測手順は ../measurements/romp/run.sh）。
 
-通常デモ:
-    python romp_video_demo.py -i demo/videos/sample_video.mp4 \
-        -o demo/output.mp4
+速度計測だけしたい場合:
+    python romp_video_demo.py -i ../datasets/videos/sample_video.mp4 \
+        --configs_yml ../measurements/romp/configs/romp_video_fp32_no_compile.yml \
+        --no_render --no_save --metrics_csv romp_metrics.csv
+
+通常デモ（描画結果を動画に保存）:
+    python romp_video_demo.py -i ../datasets/videos/sample_video.mp4 \
+        --configs_yml ../measurements/romp/configs/romp_video_fp32_no_compile.yml \
+        -o sample_video_romp.mp4
 
 bf16 モード:
-    python romp_video_demo.py -i demo/videos/sample_video.mp4 \
-        --dtype_cfg bf16 --no_render --no_save \
-        --metrics_csv datas/romp_metrics_bf16.csv
+    python romp_video_demo.py -i ../datasets/videos/sample_video.mp4 \
+        --configs_yml ../measurements/romp/configs/romp_video_bf16_no_compile.yml \
+        --dtype_cfg bf16 --no_render --no_save --metrics_csv romp_metrics_bf16.csv
 """
 
 import argparse
@@ -30,11 +35,8 @@ from tqdm import tqdm
 
 from romp.processor_bootstrap import build_video_processor
 
-# Seed固定・決定論的設定 (romp/reproducibility.py) は、build_video_processor が
-# romp.predict.video を import した時点 (モデル構築前) で適用される。
-
-torch.set_num_threads(2)
-torch.set_num_interop_threads(1)
+# Seed固定・決定論的設定 (romp/reproducibility.py) と CPU スレッド数の設定は、
+# build_video_processor の中でモデル構築前に適用される。
 
 
 def get_args():
@@ -43,25 +45,10 @@ def get_args():
     p.add_argument("--output", "-o", default=None,   help="出力動画ファイルパス")
     p.add_argument("--configs_yml", default="configs/video.yml", help="ROMPコンフィグ")
     p.add_argument("--dtype_cfg",   default="fp32",  help="精度: fp32 / bf16")
-    compile_group = p.add_mutually_exclusive_group()
-    compile_group.add_argument("--torch_compile", dest="torch_compile", action="store_true",
-                               help="torch.compile を有効化")
-    compile_group.add_argument("--no_torch_compile", dest="torch_compile", action="store_false",
-                               help="torch.compile を無効化")
-    torchao_group = p.add_mutually_exclusive_group()
-    torchao_group.add_argument("--torchao_int8_weight_only", dest="torchao_int8_weight_only", action="store_true",
-                               help="torchao の int8 weight-only を有効化")
-    torchao_group.add_argument("--no_torchao_int8_weight_only", dest="torchao_int8_weight_only", action="store_false",
-                               help="torchao の int8 weight-only を無効化")
-    p.add_argument("--torchao_int8_scope", default=None, choices=["full", "backbone"],
-                   help="torchao int8 weight-only の適用範囲")
     p.add_argument("--no_render",   action="store_true", help="メッシュ描画スキップ")
     p.add_argument("--no_save",     action="store_true", help="動画保存スキップ")
     p.add_argument("--metrics_csv", default=None,    help="フレーム毎タイミングCSV出力パス")
     p.add_argument("--warmup_frames", type=int, default=10)
-    p.add_argument("--display",     action="store_true", help="画面表示")
-    p.set_defaults(torch_compile=None)
-    p.set_defaults(torchao_int8_weight_only=None)
     return p.parse_args()
 
 
@@ -71,16 +58,9 @@ args_cli = get_args()
 def romp_override_args(args_cli):
     """Translate demo CLI flags into ROMP config overrides (applied after --configs_yml)."""
     # dtype_cfg -> model_precision: anything other than bf16 runs fp32.
+    # torch.compile / torchao の設定は YAML の値をそのまま使う。
     precision = "bf16" if str(args_cli.dtype_cfg).lower() in {"bf16", "bfloat16"} else "fp32"
-    overrides = ["--model_precision", precision]
-    # Tri-state switches: None keeps the value from the YAML config.
-    if args_cli.torch_compile is not None:
-        overrides += ["--torch_compile", "true" if args_cli.torch_compile else "false"]
-    if args_cli.torchao_int8_weight_only is not None:
-        overrides += ["--torchao_int8_weight_only", "true" if args_cli.torchao_int8_weight_only else "false"]
-    if args_cli.torchao_int8_scope is not None:
-        overrides += ["--torchao_int8_scope", args_cli.torchao_int8_scope]
-    return overrides
+    return ["--model_precision", precision]
 
 
 romp_proc = build_video_processor(
@@ -260,11 +240,6 @@ try:
                 f"render {render_ms}"
             )
 
-        if args_cli.display:
-            cv2.imshow("ROMP Video Demo", result_frame)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                break
-
         frame_idx += 1
         pbar.update(1)
         pbar.set_postfix({"persons": num_persons, "fps": f"{current_fps:.1f}"})
@@ -277,7 +252,6 @@ finally:
     cap.release()
     if writer is not None:
         writer.release()
-    cv2.destroyAllWindows()
 
     # ========= CSVサマリー書き込み =========
     if metrics_fp is not None and len(all_times["inference"]) > 0:
