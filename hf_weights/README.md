@@ -10,7 +10,7 @@ tags:
 
 # research_repo_sii2027 の作成済み重み
 
-ROMP・SAT-HMR・Fast-SAM-3D-Body の公式重みを、bf16 化・INT8 量子化・TensorRT エンジン化したものです。論文の計測で使用した重みのみを置いています。
+ROMP・SAT-HMR・Fast-SAM-3D-Body の公式重みを、bf16 化・INT8 量子化・TensorRT エンジン化したものです。
 
 ## 使い方
 
